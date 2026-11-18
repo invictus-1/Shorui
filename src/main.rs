@@ -2,6 +2,7 @@
 
 mod app;
 mod render;
+mod settings;
 mod theme;
 
 use std::{path::PathBuf, time::Instant};

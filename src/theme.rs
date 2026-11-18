@@ -160,6 +160,16 @@ pub fn apply(ctx: &egui::Context) {
     });
 }
 
+/// The surface for dialogs: raised, hairline edge, large radius, the one shadow.
+pub fn modal_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(BG_200)
+        .stroke(Stroke::new(1.0, LINE))
+        .corner_radius(CornerRadius::same(RADIUS_LG))
+        .inner_margin(egui::Margin::same(SPACE_6 as i8))
+        .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(153) })
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum Icon {
     Sidebar,
@@ -177,6 +187,7 @@ pub enum Icon {
     Up,
     Down,
     Highlighter,
+    Gear,
 }
 
 /// Draws a 16px outline icon centred on `c` with a 1.5px stroke.
@@ -259,6 +270,15 @@ pub fn paint_icon(p: &Painter, c: Pos2, icon: Icon, color: Color32) {
         }
         Icon::Up => poly(&[(-4.5, 2.5), (0.0, -2.5), (4.5, 2.5)]),
         Icon::Down => poly(&[(-4.5, -2.5), (0.0, 2.5), (4.5, -2.5)]),
+        Icon::Gear => {
+            p.circle_stroke(c, 2.4, s);
+            p.circle_stroke(c, 5.2, s);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::FRAC_PI_4;
+                let (dx, dy) = (a.cos(), a.sin());
+                seg((dx * 5.2, dy * 5.2), (dx * 7.4, dy * 7.4));
+            }
+        }
         Icon::Highlighter => {
             // A slanted marker with a stroke of ink under it.
             poly(&[(-1.5, 3.0), (-4.0, 0.5), (2.5, -6.0), (5.0, -3.5), (-1.5, 3.0)]);

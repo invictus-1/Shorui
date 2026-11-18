@@ -44,7 +44,7 @@ pub enum Req {
     /// The text between two (page, character) positions, inclusive.
     Copy { id: DocId, from: (u32, u32), to: (u32, u32) },
     /// Adds a highlight annotation over the text between two positions, inclusive.
-    Highlight { id: DocId, from: (u32, u32), to: (u32, u32) },
+    Highlight { id: DocId, from: (u32, u32), to: (u32, u32), color: [u8; 3] },
     /// Removes the topmost highlight under a point given in top-left page points.
     Unhighlight { id: DocId, page: u32, at: [f32; 2] },
 }
@@ -498,7 +498,7 @@ impl Worker {
                 }
                 self.send(Resp::Copied(out));
             }
-            Req::Highlight { id, from, to } => {
+            Req::Highlight { id, from, to, color } => {
                 // Work out the line rectangles first, while the page text is still cached.
                 let mut plan: Vec<(u32, Vec<[f32; 4]>)> = Vec::new();
                 for page in from.0..=to.0 {
@@ -533,7 +533,7 @@ impl Worker {
                             u = [u[0].min(r[0]), u[1].min(r[1]), u[2].max(r[2]), u[3].max(r[3])];
                         }
                         a.set_bounds(PdfRect::new_from_values(u[1], u[0], u[3], u[2]))?;
-                        a.set_stroke_color(PdfColor::new(255, 216, 77, 255))?;
+                        a.set_stroke_color(PdfColor::new(color[0], color[1], color[2], 255))?;
                         for r in rects {
                             // PDF order: top-left, top-right, bottom-left, bottom-right.
                             let quad = PdfQuadPoints::new_from_values(r[0], r[3], r[2], r[3], r[0], r[1], r[2], r[1]);

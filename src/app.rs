@@ -13,6 +13,7 @@ use egui::{
 
 use crate::{
     render::{DocId, Gens, PageText, Req, Resp, TILE, line_rects},
+    settings::{self, OpenZoom, Settings, Update},
     theme::{self, Icon, *},
 };
 
@@ -452,6 +453,7 @@ enum Action {
     SelectAll,
     Highlight,
     Unhighlight(u32, Vec2),
+    Settings,
 }
 
 enum Confirm {
@@ -497,6 +499,14 @@ pub struct App {
     selftest: Option<SelfTest>,
     clipboard: Option<String>,
     last_copied: Option<String>,
+    settings: Settings,
+    settings_open: bool,
+    update: Update,
+    update_tx: std::sync::mpsc::Sender<Update>,
+    update_rx: std::sync::mpsc::Receiver<Update>,
+    /// True while the running check was started by the app itself, not by the user.
+    quiet_check: bool,
+    about_icon: Option<TextureHandle>,
 }
 
 impl App {
@@ -514,6 +524,8 @@ impl App {
         theme::apply(&cc.egui_ctx);
         let themed = t0.elapsed();
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        let settings = Settings::load();
+        let (update_tx, update_rx) = std::sync::mpsc::channel();
         let selftest = std::env::var_os("SHORUI_SELFTEST").map(|d| SelfTest {
             dir: PathBuf::from(d),
             phase: 0,
@@ -536,7 +548,7 @@ impl App {
             docs: Vec::new(),
             active: 0,
             next_id: 1,
-            sidebar: true,
+            sidebar: settings.sidebar,
             frame: 0,
             toast: None,
             fatal: None,
@@ -549,12 +561,26 @@ impl App {
             selftest,
             clipboard: None,
             last_copied: None,
+            settings,
+            settings_open: false,
+            update: Update::Idle,
+            update_tx,
+            update_rx,
+            quiet_check: false,
+            about_icon: None,
         };
         for f in files {
             app.docs.push(DocView::new(app.next_id, f));
             app.next_id += 1;
         }
         app.active = app.docs.len().saturating_sub(1);
+        if app.selftest.is_none() && app.settings.auto_update && settings::now() > app.settings.last_check + 86_400 {
+            app.settings.last_check = settings::now();
+            app.settings.save();
+            app.update = Update::Checking;
+            app.quiet_check = true;
+            settings::check(app.update_tx.clone(), cc.egui_ctx.clone());
+        }
         app
     }
 
@@ -756,7 +782,7 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let typing = ctx.memory(|m| m.focused().is_some());
-        let modal = self.confirm.is_some() || self.password_prompt.is_some();
+        let modal = self.confirm.is_some() || self.password_prompt.is_some() || self.settings_open;
         if modal {
             return;
         }
@@ -773,6 +799,9 @@ impl App {
             }
             if i.consume_key(Modifiers::COMMAND, Key::W) {
                 actions.push(Action::Close(self.active));
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::Comma) {
+                actions.push(Action::Settings);
             }
             if i.consume_key(Modifiers::COMMAND, Key::F) {
                 actions.push(Action::SearchOpen);
@@ -914,7 +943,12 @@ impl App {
                     }
                 }
                 Action::Activate(i) => self.activate(i),
-                Action::ToggleSidebar => self.sidebar = !self.sidebar,
+                Action::ToggleSidebar => {
+                    self.sidebar = !self.sidebar;
+                    self.settings.sidebar = self.sidebar;
+                    self.settings.save();
+                }
+                Action::Settings => self.settings_open = true,
                 Action::SearchOpen => {
                     if let Some(d) = self.doc() {
                         d.search_open = true;
@@ -952,7 +986,8 @@ impl App {
                 Action::Highlight => {
                     if let Some(d) = self.docs.get(self.active) {
                         if let Some((from, to)) = d.sel_range() {
-                            let _ = self.req.send(Req::Highlight { id: d.id, from, to });
+                            let color = self.settings.highlight_rgb();
+                            let _ = self.req.send(Req::Highlight { id: d.id, from, to, color });
                         }
                     }
                 }
@@ -1036,7 +1071,7 @@ impl App {
                 actions.push(Action::ToggleSidebar);
             }
             let n = self.docs.len().max(1) as f32;
-            let avail = ui.available_width() - 40.0;
+            let avail = ui.available_width() - 80.0;
             let tab_w = ((avail - SPACE_1 * n) / n).clamp(48.0, 220.0);
             for (i, d) in self.docs.iter().enumerate() {
                 let (rect, resp) = ui.allocate_exact_size(vec2(tab_w, 30.0), Sense::click());
@@ -1078,6 +1113,16 @@ impl App {
             if theme::icon_button(ui, Icon::Plus, "Open  Ctrl+O", true, false).clicked() {
                 actions.push(Action::OpenDialog);
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let resp = theme::icon_button(ui, Icon::Gear, "Settings  Ctrl+,", true, self.settings_open);
+                if matches!(self.update, Update::Available { .. }) {
+                    // A new version is waiting.
+                    ui.painter().circle_filled(resp.rect.right_top() + vec2(-7.0, 7.0), 3.5, ACCENT_BRIGHT);
+                }
+                if resp.clicked() {
+                    actions.push(Action::Settings);
+                }
+            });
         });
     }
 
@@ -1336,7 +1381,7 @@ impl App {
         let ppp = ui.ctx().pixels_per_point();
         let now = ui.input(|i| i.time);
         let frame = self.frame;
-        let Self { docs, req, gens, active, .. } = self;
+        let Self { docs, req, gens, active, settings, .. } = self;
         let Some(d) = docs.get_mut(*active) else { return };
         let painter = ui.painter_at(rect);
         if let Some(e) = &d.error {
@@ -1357,7 +1402,11 @@ impl App {
         d.view = rect.size();
         if d.needs_fit {
             d.needs_fit = false;
-            d.zoom = d.fit_zoom(Fit::Width).clamp(MIN_ZOOM, 1.5);
+            match settings.open_zoom {
+                OpenZoom::FitWidth => d.zoom = d.fit_zoom(Fit::Width).clamp(MIN_ZOOM, 1.5),
+                OpenZoom::FitPage => d.fit = Fit::Page,
+                OpenZoom::Actual => d.zoom = 1.0,
+            }
         }
         if d.fit != Fit::None {
             let z = d.fit_zoom(d.fit);
@@ -1686,6 +1735,167 @@ impl App {
         }
     }
 
+    /// Takes results from the update worker.
+    fn poll_update(&mut self, ctx: &egui::Context, now: f64) {
+        while let Ok(u) = self.update_rx.try_recv() {
+            let quiet = std::mem::take(&mut self.quiet_check);
+            match &u {
+                Update::Available { version, .. } if quiet => {
+                    self.say(format!("Shorui {version} is available. Open Settings to update."), false, now + 4.0);
+                }
+                // A background check that fails or finds nothing stays silent.
+                Update::Failed(_) | Update::UpToDate if quiet => {
+                    self.update = Update::Idle;
+                    continue;
+                }
+                Update::Installing => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                _ => {}
+            }
+            self.update = u;
+        }
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let before = self.settings.clone();
+        let icon = self
+            .about_icon
+            .get_or_insert_with(|| {
+                let image = egui::ColorImage::from_rgba_unmultiplied([64, 64], include_bytes!("../assets/icon-64.rgba"));
+                ctx.load_texture("icon", image, egui::TextureOptions::LINEAR)
+            })
+            .clone();
+        let mut close = false;
+        let section = |ui: &mut Ui, text: &str| {
+            ui.add_space(SPACE_3);
+            ui.label(RichText::new(text).font(theme::label()).color(INK_MUTED));
+        };
+        let primary =
+            |text: &str| egui::Button::new(RichText::new(text).font(theme::label()).color(ON_ACCENT)).fill(ACCENT);
+        let plain = |text: &str| egui::Button::new(RichText::new(text).font(theme::label()));
+        let modal = egui::Modal::new(Id::unique("settings")).frame(theme::modal_frame()).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.spacing_mut().item_spacing.y = SPACE_2;
+            ui.label(RichText::new("Settings").font(theme::title()));
+
+            section(ui, "When a PDF opens");
+            ui.horizontal(|ui| {
+                for (value, text) in
+                    [(OpenZoom::FitWidth, "Fit width"), (OpenZoom::FitPage, "Fit page"), (OpenZoom::Actual, "100%")]
+                {
+                    let on = self.settings.open_zoom == value;
+                    let button = if on { primary(text) } else { plain(text) };
+                    if ui.add(button).clicked() {
+                        self.settings.open_zoom = value;
+                    }
+                }
+            });
+            if ui.checkbox(&mut self.settings.sidebar, RichText::new("Show page thumbnails").font(theme::body())).changed() {
+                self.sidebar = self.settings.sidebar;
+            }
+
+            section(ui, "Highlight colour");
+            ui.horizontal(|ui| {
+                for (i, (name, rgb)) in settings::HIGHLIGHTS.iter().enumerate() {
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+                    let color = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                    ui.painter().circle_filled(rect.center(), 9.0, color);
+                    if self.settings.highlight == i {
+                        ui.painter().circle_stroke(rect.center(), 12.5, Stroke::new(2.0, ACCENT_BRIGHT));
+                    }
+                    if resp.on_hover_text(*name).clicked() {
+                        self.settings.highlight = i;
+                    }
+                }
+            });
+
+            section(ui, "Default app");
+            ui.horizontal(|ui| {
+                if ui.add(plain("Make Shorui the default PDF app")).clicked() {
+                    settings::open_default_apps();
+                }
+            });
+            ui.label(
+                RichText::new("Opens Windows Settings. Set .pdf to Shorui there; Windows doesn't let apps do it for you.")
+                    .font(theme::caption())
+                    .color(INK_MUTED),
+            );
+
+            section(ui, "Updates");
+            ui.checkbox(
+                &mut self.settings.auto_update,
+                RichText::new("Check for updates when Shorui starts").font(theme::body()),
+            );
+            ui.horizontal(|ui| match self.update.clone() {
+                Update::Available { version, url } => {
+                    if ui.add(primary(&format!("Install {version}"))).clicked() {
+                        self.update = Update::Downloading { version: version.clone() };
+                        settings::download_and_run(version, url, self.update_tx.clone(), ctx.clone());
+                    }
+                    ui.label(RichText::new("A new version is available.").font(theme::body()).color(INK_MUTED));
+                }
+                Update::Checking => {
+                    ui.add_enabled(false, plain("Checking"));
+                }
+                Update::Downloading { version } => {
+                    ui.add_enabled(false, plain("Downloading"));
+                    ui.label(RichText::new(format!("Getting {version}. Shorui will close to update.")).font(theme::body()).color(INK_MUTED));
+                }
+                state => {
+                    if ui.add(plain("Check for updates")).clicked() {
+                        self.update = Update::Checking;
+                        self.quiet_check = false;
+                        self.settings.last_check = settings::now();
+                        settings::check(self.update_tx.clone(), ctx.clone());
+                    }
+                    let (text, color) = match state {
+                        Update::UpToDate => ("You have the latest version.".to_string(), INK_MUTED),
+                        Update::Failed(e) => (e, DANGER),
+                        _ => (String::new(), INK_MUTED),
+                    };
+                    ui.label(RichText::new(text).font(theme::body()).color(color));
+                }
+            });
+            ui.label(
+                RichText::new("The check asks GitHub for the latest release. Nothing about you or your files is sent.")
+                    .font(theme::caption())
+                    .color(INK_MUTED),
+            );
+
+            section(ui, "About");
+            ui.horizontal(|ui| {
+                ui.add(egui::Image::new(&icon).fit_to_exact_size(Vec2::splat(48.0)));
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(RichText::new(format!("Shorui {}", settings::VERSION)).font(theme::body()).color(INK));
+                    ui.label(
+                        RichText::new("A fast PDF reader and editor. MIT licence. Renders with PDFium.")
+                            .font(theme::caption())
+                            .color(INK_MUTED),
+                    );
+                    if ui.link(RichText::new("github.com/invictus-1/Shorui").font(theme::caption())).clicked() {
+                        settings::open_url(settings::REPO_URL);
+                    }
+                });
+            });
+
+            ui.add_space(SPACE_3);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(primary("Done")).clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close || modal.should_close() {
+            self.settings_open = false;
+        }
+        if self.settings != before {
+            self.settings.save();
+        }
+    }
+
     fn modals(&mut self, ctx: &egui::Context) {
         let primary = |text: &str| {
             egui::Button::new(RichText::new(text).font(theme::label()).color(ON_ACCENT)).fill(ACCENT)
@@ -1709,7 +1919,7 @@ impl App {
                 }
             };
             let mut choice = 0;
-            let modal = egui::Modal::new(Id::unique("confirm")).show(ctx, |ui| {
+            let modal = egui::Modal::new(Id::unique("confirm")).frame(theme::modal_frame()).show(ctx, |ui| {
                 ui.set_width(340.0);
                 ui.label(RichText::new(title).font(theme::title()));
                 ui.label(RichText::new(body).font(theme::body()).color(INK_MUTED));
@@ -1755,7 +1965,7 @@ impl App {
         if let Some((id, text, wrong)) = &mut self.password_prompt {
             let id = *id;
             let mut choice = 0;
-            let modal = egui::Modal::new(Id::unique("password")).show(ctx, |ui| {
+            let modal = egui::Modal::new(Id::unique("password")).frame(theme::modal_frame()).show(ctx, |ui| {
                 ui.set_width(340.0);
                 ui.label(RichText::new("Password needed").font(theme::title()));
                 let note = if *wrong { "That password didn't work." } else { "This PDF is locked." };
@@ -1892,8 +2102,8 @@ impl App {
             6 if t.shots.load(Ordering::Relaxed) >= 4 && self.last_copied.is_some() => {
                 t.log += &format!("copied selection: {:?}\n", self.last_copied.as_deref().unwrap_or(""));
                 // Highlight a selection that spans the title and three lines, plus one on page 2.
-                let _ = self.req.send(Req::Highlight { id: d.id, from: (0, 0), to: (0, 260) });
-                let _ = self.req.send(Req::Highlight { id: d.id, from: (1, 30), to: (1, 120) });
+                let _ = self.req.send(Req::Highlight { id: d.id, from: (0, 0), to: (0, 260), color: [255, 216, 77] });
+                let _ = self.req.send(Req::Highlight { id: d.id, from: (1, 30), to: (1, 120), color: [255, 216, 77] });
                 let _ = self.req.send(Req::Unhighlight { id: d.id, page: 1, at: [200.0, 90.0] });
                 d.search_open = false;
                 d.hits.clear();
@@ -1917,6 +2127,19 @@ impl App {
                 t.phase = 61;
             }
             61 if t.shots.load(Ordering::Relaxed) >= 5 => {
+                self.settings_open = true;
+                t.frames = 0;
+                t.phase = 62;
+            }
+            62 => {
+                t.frames += 1;
+                if t.frames == 4 {
+                    shot("settings.bmp", t);
+                    t.phase = 63;
+                }
+            }
+            63 if t.shots.load(Ordering::Relaxed) >= 6 => {
+                self.settings_open = false;
                 // Edit round trip: rotate page 1, delete page 2, save a copy.
                 let _ = self.req.send(Req::Rotate { id: d.id, pages: vec![0], clockwise: true });
                 let _ = self.req.send(Req::Delete { id: d.id, pages: vec![1] });
@@ -1934,7 +2157,24 @@ impl App {
                 shot("edited.bmp", t);
                 t.phase = 8;
             }
-            8 if t.shots.load(Ordering::Relaxed) >= 6 => {
+            8 if t.shots.load(Ordering::Relaxed) >= 7 => {
+                if std::env::var_os("SHORUI_SELFTEST_UPDATE").is_some() {
+                    // Exercise the update check against the real GitHub repo.
+                    let describe = |u: Update| match u {
+                        Update::UpToDate => "up to date".to_string(),
+                        Update::Available { version, url } => format!("{version} available at {url}"),
+                        Update::Failed(e) => format!("failed: {e}"),
+                        _ => "unexpected state".to_string(),
+                    };
+                    t.log += &format!(
+                        "update check as {}: {}
+update check as 0.0.1: {}
+",
+                        settings::VERSION,
+                        describe(settings::latest_release(settings::VERSION)),
+                        describe(settings::latest_release("0.0.1"))
+                    );
+                }
                 let _ = std::fs::write(t.dir.join("log.txt"), &t.log);
                 std::process::exit(0);
             }
@@ -2018,6 +2258,8 @@ impl eframe::App for App {
         egui::CentralPanel::no_frame().show(ui, |ui| self.viewer(ui, &mut actions));
 
         self.flush_thumbs();
+        self.poll_update(&ctx, now);
+        self.settings_window(&ctx);
         self.modals(&ctx);
         self.toast(&ctx);
         self.apply(&ctx, actions);
