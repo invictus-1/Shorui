@@ -7,7 +7,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -40,6 +40,8 @@ pub struct Gens {
     pub tile: AtomicU64,
     pub thumb: AtomicU64,
     pub search: AtomicU64,
+    /// Whether pages without text are run through OCR.
+    pub ocr: AtomicBool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -109,6 +111,10 @@ pub struct PageText {
     /// Sticky notes: where they are and what they say.
     pub notes: Vec<([f32; 4], String)>,
     pub links: Vec<([f32; 4], Link)>,
+    /// True when the characters came from OCR of a scanned page.
+    pub ocr: bool,
+    /// True once OCR has been considered for this page, so it isn't tried again.
+    ocr_checked: bool,
     /// PDF page space to top-left points: origin, then the images of the x and y unit vectors.
     m: [f32; 6],
 }
@@ -259,6 +265,59 @@ struct Doc {
     password: Option<String>,
     undo: Vec<Step>,
     redo: Vec<Step>,
+    /// Recognised text of scanned pages, kept so each page is read once.
+    ocr: HashMap<u32, Arc<Recognised>>,
+}
+
+/// Characters and their boxes in top-left page points.
+type Recognised = (Vec<char>, Vec<[f32; 4]>);
+
+/// Runs OCR on a page with no text of its own.
+fn recognise(page: &PdfPage<'static>, engine: &crate::ocr::Engine) -> Option<Recognised> {
+    if page.objects().is_empty() {
+        return Some((Vec::new(), Vec::new()));
+    }
+    // About 180 dpi: enough for body text, within the engine's size limit.
+    let (wpt, hpt) = (page.width().value.max(1.0), page.height().value.max(1.0));
+    let cap = engine.max_dim.min(3200) as f32;
+    let scale = 2.5f32.min(cap / wpt.max(hpt));
+    let (pw, ph) = ((wpt * scale).round().max(1.0) as i32, (hpt * scale).round().max(1.0) as i32);
+    let mut bitmap = PdfBitmap::empty(pw, ph, PdfBitmapFormat::BGRA).ok()?;
+    let config = PdfRenderConfig::new()
+        .set_target_size(pw, ph)
+        .set_format(PdfBitmapFormat::BGRA)
+        .set_clear_color(PdfColor::new(255, 255, 255, 255))
+        .render_annotations(false);
+    page.render_into_bitmap_with_config(&mut bitmap, &config).ok()?;
+    let raw = bitmap.as_raw_bytes();
+    let stride = raw.len() / ph as usize;
+    let bgra: Vec<u8> = if stride == pw as usize * 4 {
+        raw
+    } else {
+        raw.chunks_exact(stride).flat_map(|row| row[..pw as usize * 4].iter().copied()).collect()
+    };
+
+    let lines = engine.recognise(&bgra, pw, ph)?;
+    let (mut chars, mut boxes) = (Vec::new(), Vec::new());
+    for line in lines {
+        for (i, word) in line.iter().enumerate() {
+            if i > 0 {
+                chars.push(' ');
+                boxes.push([0.0; 4]);
+            }
+            // The engine gives one box per word: share it out evenly between the letters.
+            let n = word.text.chars().count().max(1) as f32;
+            let [x0, y0, x1, y1] = word.rect;
+            for (k, c) in word.text.chars().enumerate() {
+                let (a, b) = (x0 + (x1 - x0) * k as f32 / n, x0 + (x1 - x0) * (k + 1) as f32 / n);
+                chars.push(c);
+                boxes.push([a / scale, y0 / scale, b / scale, y1 / scale]);
+            }
+        }
+        chars.extend(['\r', '\n']);
+        boxes.extend([[0.0; 4], [0.0; 4]]);
+    }
+    Some((chars, boxes))
 }
 
 struct Worker {
@@ -268,6 +327,10 @@ struct Worker {
     texts: VecDeque<((DocId, u32), Arc<PageText>)>,
     ctx: egui::Context,
     out: Sender<Resp>,
+    gens: Arc<Gens>,
+    /// The Windows OCR engine, created the first time a scanned page needs it.
+    ocr: Option<crate::ocr::Engine>,
+    ocr_tried: bool,
 }
 
 struct TileJob {
@@ -467,6 +530,8 @@ fn extract(page: &PdfPage<'static>) -> Option<PageText> {
         marks: Vec::new(),
         notes: Vec::new(),
         links: Vec::new(),
+        ocr: false,
+        ocr_checked: false,
         m: [o.0, o.1, ax, ay, bx, by],
     };
     let rect = |r: &PdfRect| [r.left().value, r.bottom().value, r.right().value, r.top().value];
@@ -566,7 +631,17 @@ fn run(ctx: egui::Context, gens: Arc<Gens>, rx: Receiver<Req>, out: Sender<Resp>
     };
     // Leaked on purpose: documents borrow the library for the life of the process.
     let pdfium: &'static Pdfium = Box::leak(Box::new(Pdfium::new(bindings)));
-    let mut w = Worker { pdfium, docs: HashMap::new(), pages: VecDeque::new(), texts: VecDeque::new(), ctx, out };
+    let mut w = Worker {
+        pdfium,
+        docs: HashMap::new(),
+        pages: VecDeque::new(),
+        texts: VecDeque::new(),
+        ctx,
+        out,
+        gens: gens.clone(),
+        ocr: None,
+        ocr_tried: false,
+    };
 
     let mut tiles: VecDeque<TileJob> = VecDeque::new();
     let mut thumbs: VecDeque<ThumbJob> = VecDeque::new();
@@ -641,12 +716,49 @@ impl Worker {
         self.ctx.request_repaint();
     }
 
-    /// A page's text, from a small cache shared by search, selection and copy.
+    /// A page's text, from a small cache shared by search, selection and copy. A page with no
+    /// text of its own is read with OCR, once.
     fn text(&mut self, id: DocId, page: u32) -> Option<Arc<PageText>> {
-        if let Some((_, t)) = self.texts.iter().find(|(k, _)| *k == (id, page)) {
-            return Some(t.clone());
+        let want_ocr = self.gens.ocr.load(Ordering::Relaxed);
+        if let Some(pos) = self.texts.iter().position(|(k, _)| *k == (id, page)) {
+            let t = &self.texts[pos].1;
+            if t.ocr_checked || !want_ocr {
+                return Some(t.clone());
+            }
+            // Cached before OCR was switched on: read the page again.
+            self.texts.remove(pos);
         }
-        let text = Arc::new(extract(self.page(id, page)?)?);
+        let saved = self.docs.get(&id).and_then(|d| d.ocr.get(&page).cloned());
+        if want_ocr && saved.is_none() && !self.ocr_tried {
+            self.ocr_tried = true;
+            self.ocr = crate::ocr::Engine::new();
+        }
+        let engine = if want_ocr { self.ocr.clone() } else { None };
+
+        let p = self.page(id, page)?;
+        let mut t = extract(p)?;
+        let mut fresh = None;
+        if want_ocr {
+            t.ocr_checked = true;
+            if !t.chars.iter().any(|c| !c.is_whitespace()) {
+                let found = match saved {
+                    Some(r) => Some(r),
+                    None => {
+                        fresh = engine.and_then(|e| recognise(p, &e)).map(Arc::new);
+                        fresh.clone()
+                    }
+                };
+                if let Some(r) = found {
+                    t.ocr = !r.0.is_empty();
+                    t.chars = r.0.clone();
+                    t.boxes = r.1.clone();
+                }
+            }
+        }
+        if let (Some(r), Some(d)) = (fresh, self.docs.get_mut(&id)) {
+            d.ocr.insert(page, r);
+        }
+        let text = Arc::new(t);
         self.texts.push_front(((id, page), text.clone()));
         self.texts.truncate(64);
         Some(text)
@@ -678,7 +790,7 @@ impl Worker {
                 match self.pdfium.load_pdf_from_file(&path, password.as_deref()) {
                     Ok(doc) => {
                         let (sizes, outline) = (sizes_of(&doc), outline_of(&doc));
-                        self.docs.insert(id, Doc { doc, epoch: 0, password, undo: Vec::new(), redo: Vec::new() });
+                        self.docs.insert(id, Doc { doc, epoch: 0, password, undo: Vec::new(), redo: Vec::new(), ocr: HashMap::new() });
                         self.send(Resp::Opened { id, sizes, outline });
                     }
                     Err(e) => {
@@ -1015,6 +1127,7 @@ impl Worker {
                 };
                 if let Some(d) = self.docs.get_mut(&id) {
                     d.doc = doc;
+                    d.ocr.clear();
                 }
                 Ok((Step::Restore(current), Changed::All))
             }
@@ -1026,6 +1139,10 @@ impl Worker {
         self.drop_pages(id);
         let Some(d) = self.docs.get_mut(&id) else { return };
         d.epoch += 1;
+        if matches!(changed, Changed::All) {
+            // Pages may have moved, so recognised text no longer lines up with page numbers.
+            d.ocr.clear();
+        }
         let resp = Resp::Edited {
             id,
             epoch: d.epoch,

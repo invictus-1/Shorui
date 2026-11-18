@@ -38,6 +38,8 @@ pub struct Settings {
     pub last_check: u64,
     pub restore_session: bool,
     pub two_page: bool,
+    /// Read scanned pages with OCR so their text can be found and selected.
+    pub ocr: bool,
     /// Most recently opened files, newest first.
     pub recent: Vec<PathBuf>,
     /// The tabs open when Shorui last closed: file, page and zoom.
@@ -51,6 +53,7 @@ impl Default for Settings {
             last_check: 0,
             restore_session: true,
             two_page: false,
+            ocr: true,
             recent: Vec::new(),
             session: Vec::new(),
         }
@@ -85,6 +88,7 @@ impl Settings {
                 ("last_check", v) => s.last_check = v.parse().unwrap_or(0),
                 ("restore_session", v) => s.restore_session = v == "true",
                 ("two_page", v) => s.two_page = v == "true",
+                ("ocr", v) => s.ocr = v == "true",
                 ("recent", v) if !v.is_empty() => s.recent.push(PathBuf::from(v)),
                 ("session", v) => {
                     // file|page|zoom. '|' can't appear in a Windows path.
@@ -116,7 +120,7 @@ impl Settings {
             self.sidebar, self.auto_update, self.highlight, self.last_check
         );
         let mut text = text;
-        text += &format!("restore_session={}\ntwo_page={}\n", self.restore_session, self.two_page);
+        text += &format!("restore_session={}\ntwo_page={}\nocr={}\n", self.restore_session, self.two_page, self.ocr);
         for r in &self.recent {
             text += &format!("recent={}\n", r.display());
         }

@@ -620,6 +620,7 @@ impl App {
         let themed = t0.elapsed();
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let settings = Settings::load();
+        gens.ocr.store(settings.ocr, Ordering::Relaxed);
         let (update_tx, update_rx) = std::sync::mpsc::channel();
         let selftest = std::env::var_os("SHORUI_SELFTEST").map(|d| SelfTest {
             dir: PathBuf::from(d),
@@ -2268,6 +2269,18 @@ impl App {
                     }
                 }
             });
+            if ui
+                .checkbox(&mut self.settings.ocr, RichText::new("Read scanned pages with OCR").font(theme::body()))
+                .on_hover_text("Lets you find, select and highlight text in scans. Runs on this PC, in the languages installed in Windows.")
+                .changed()
+            {
+                self.gens.ocr.store(self.settings.ocr, Ordering::Relaxed);
+                // Ask for page text again so the change shows on the pages already open.
+                for d in &mut self.docs {
+                    d.texts.clear();
+                    d.text_pending.clear();
+                }
+            }
             ui.checkbox(
                 &mut self.settings.restore_session,
                 RichText::new("Reopen the last tabs when Shorui starts").font(theme::body()),
@@ -2538,6 +2551,51 @@ impl App {
     fn run_selftest(&mut self, ctx: &egui::Context, ui_time: Duration) {
         let Some(t) = &mut self.selftest else { return };
         let Some(d) = self.docs.get_mut(self.active) else { return };
+        if let Some(word) = std::env::var_os("SHORUI_SELFTEST_OCR") {
+            ctx.request_repaint();
+            match t.phase {
+                0 if !d.loading && d.complete && d.texts.contains_key(&0) => {
+                    let x = &d.texts[&0];
+                    let sample: String = x.chars.iter().take(70).filter(|c| **c != '\r' && **c != '\n').collect();
+                    t.log += &format!(
+                        "scanned page 1: text from OCR: {}, {} characters, starts {:?}\n",
+                        x.ocr,
+                        x.chars.len(),
+                        sample
+                    );
+                    d.search_open = true;
+                    d.query = word.to_string_lossy().into_owned();
+                    start_search(d, &self.req, &self.gens);
+                    d.sel = Some(((0, 0), (0, 40)));
+                    t.zoom_started = Some(Instant::now());
+                    t.phase = 1;
+                }
+                1 if d.search_done && d.complete => {
+                    let ms = t.zoom_started.unwrap().elapsed().as_secs_f64() * 1000.0;
+                    let mut pages: Vec<u32> = d.hits.iter().map(|h| h.page).collect();
+                    pages.dedup();
+                    t.log += &format!(
+                        "search {:?} over {} scanned pages: {} matches on {} pages in {ms:.0} ms\n",
+                        d.query,
+                        d.n(),
+                        d.hits.len(),
+                        pages.len()
+                    );
+                    let (dir, shots) = (t.dir.clone(), t.shots.clone());
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |img| {
+                        let _ = write_bmp(&dir.join("ocr.bmp"), &img);
+                        shots.fetch_add(1, Ordering::Relaxed);
+                    })));
+                    t.phase = 2;
+                }
+                2 if t.shots.load(Ordering::Relaxed) >= 1 => {
+                    let _ = std::fs::write(t.dir.join("log.txt"), &t.log);
+                    std::process::exit(0);
+                }
+                _ => {}
+            }
+            return;
+        }
         ctx.request_repaint();
         let elapsed = self.t0.elapsed().as_secs_f64() * 1000.0;
         let shot = |name: &'static str, t: &SelfTest| {
