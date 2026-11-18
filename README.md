@@ -4,13 +4,15 @@ A fast PDF reader and editor for Windows. Rust, PDFium (the PDF engine in Chrome
 
 ![Shorui with a document open](docs/screenshots/reader.png)
 
-| Find and select | Highlight |
+| Find and select | Annotate |
 | --- | --- |
-| ![Find in document](docs/screenshots/find.png) | ![Highlighted text](docs/screenshots/highlight.png) |
+| ![Find in document](docs/screenshots/find.png) | ![Highlight, underline, strikeout, note and pen](docs/screenshots/annotations.png) |
 
-| Zoom to 6400% | Settings |
+| Two-page view with the outline | Settings |
 | --- | --- |
-| ![Zoomed in](docs/screenshots/zoom.png) | ![Settings window](docs/screenshots/settings.png) |
+| ![Two pages side by side](docs/screenshots/two-page.png) | ![Settings window](docs/screenshots/settings.png) |
+
+<img src="docs/screenshots/zoom.png" alt="Zoomed to 400%" width="640">
 
 ## Download
 
@@ -39,16 +41,29 @@ The built app is `target\release\shorui.exe`. It needs `pdfium.dll` beside it; t
 
 ## What it does
 
-- Tabs, a thumbnail sidebar, continuous scrolling.
-- Zoom from 10% to 6400% with Ctrl+wheel, pinch, or the toolbar. Zoom is anchored on the pointer.
-- Fit width and fit page.
-- Rotate pages, delete pages, save, save as. Select several pages in the sidebar with Ctrl+click or Shift+click.
+**Read**
+- Tabs, a thumbnail sidebar, continuous scrolling, and a two-page view.
+- Zoom from 10% to 6400% with Ctrl+wheel, pinch, or the toolbar. Zoom is anchored on the pointer and never blocks.
+- Outline panel when the PDF has bookmarks. Links inside pages are clickable.
 - Find in document: matches stream in as pages are searched, ignoring case and line breaks.
 - Select text by dragging, double-click a word, copy with Ctrl+C. Middle or right drag pans.
-- Highlight selected text with H or the toolbar marker. Right-click a highlight to remove it. Highlights are saved into the PDF as standard annotations.
-- Settings (the gear button, or Ctrl+,): zoom on open, thumbnails, highlight colour, updates and an about page.
-- Password-protected PDFs.
-- Drop files on the window to open them.
+- Reopens your last tabs at the page and zoom you left them, and lists recent files on the empty window.
+- Password-protected PDFs. Drop files on the window to open them.
+
+**Annotate**
+- Highlight (H), underline (U) and strike out (S) the selected text. Highlights come in four colours.
+- Sticky notes: right-click a page and choose "Add note here". Hover a note to read it.
+- Pen (P): draw freehand on the page.
+- Right-click any of these and choose "Remove annotation".
+- All of them are standard PDF annotations saved into the file, so other readers show them too.
+
+**Edit pages**
+- Drag thumbnails to reorder pages. Ctrl+click or Shift+click selects several.
+- Right-click a thumbnail to rotate, delete, extract pages to a new PDF, or insert another PDF before or after.
+- Undo and redo for every page edit and annotation.
+- Save, save as, and print.
+
+**Settings** (the gear button, or Ctrl+,): zoom on open, session restore, thumbnails, highlight colour, updates and an about page.
 
 ## Shortcuts
 
@@ -65,6 +80,11 @@ The built app is `target\release\shorui.exe`. It needs `pdfium.dll` beside it; t
 | Ctrl+F | Find. Enter and Shift+Enter (or F3 and Shift+F3) step through matches, Esc closes |
 | Ctrl+C, Ctrl+A | Copy the selected text, select all text |
 | H | Highlight the selected text |
+| U, S | Underline, strike out the selected text |
+| P | Pen on or off |
+| Ctrl+Z, Ctrl+Y | Undo, redo |
+| Ctrl+P | Print |
+| Ctrl+3 | Two-page view |
 | Ctrl+B | Show or hide thumbnails |
 | Ctrl+, | Settings |
 | Page Up/Down, Space, arrows, Home, End | Move through the document |
@@ -98,8 +118,10 @@ The result is `target\release\shorui-setup.exe`. Build the app first: the instal
 - Requests for tiles you have scrolled or zoomed past are cancelled before the worker gets to them.
 - Search and text extraction run on the same worker one page at a time, behind tile rendering, so scrolling and zooming stay smooth while a search is running.
 - PDFium loads and the file opens while the window is still being created.
+- Undo keeps cheap inverse steps where it can (rotate, move, add annotation) and falls back to a snapshot of the document only for edits with no inverse (delete, insert, remove annotation).
+- Printing draws each page straight onto the printer's device context, so output is vector, not a scaled bitmap.
 
-`src/app.rs` is the UI and view state. `src/theme.rs` holds the design tokens from the Shorui design system.
+`src/app.rs` is the UI and view state. `src/settings.rs` holds preferences and the update check, `src/print.rs` the printing. `src/theme.rs` holds the design tokens from the Shorui design system.
 
 ## Measuring
 
