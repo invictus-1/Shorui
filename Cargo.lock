@@ -1986,7 +1986,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shorui"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "crossbeam-channel",
  "eframe",
@@ -1994,6 +1994,7 @@ dependencies = [
  "embed-resource",
  "ort",
  "pdfium-render",
+ "raw-window-handle",
  "rfd",
  "sha2",
  "windows",
@@ -2001,7 +2002,7 @@ dependencies = [
 
 [[package]]
 name = "shorui-setup"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "eframe",
  "egui",

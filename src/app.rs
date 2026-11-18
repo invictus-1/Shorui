@@ -716,6 +716,8 @@ pub struct App {
     /// A neural OCR download in progress: the engine, bytes done, bytes in all.
     ocr_download: Option<(Kind, u64, u64)>,
     ocr_error: Option<String>,
+    /// The native window, once known. Its saved place is restored on the first frame.
+    hwnd: Option<isize>,
 }
 
 impl App {
@@ -791,6 +793,7 @@ impl App {
             pack_rx,
             ocr_download: None,
             ocr_error: None,
+            hwnd: None,
         };
         for f in files {
             let mut doc = DocView::new(app.next_id, f);
@@ -3598,9 +3601,28 @@ impl eframe::App for App {
         self.settings.save();
     }
 
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let started = Instant::now();
         let ctx = ui.ctx().clone();
+        if self.selftest.is_none() {
+            match self.hwnd {
+                // First frame, before the window is shown: put it back where it was.
+                None => {
+                    self.hwnd = crate::window::hwnd(frame);
+                    if let (Some(h), Some(p)) = (self.hwnd, self.settings.window) {
+                        crate::window::restore(h, p);
+                    }
+                }
+                // Keep track of where it is, so it can be saved when Shorui closes. Presentation
+                // mode's full screen isn't a place to come back to.
+                Some(h) if self.present.is_none() => {
+                    if let Some(p) = crate::window::read(h) {
+                        self.settings.window = Some(p);
+                    }
+                }
+                Some(_) => {}
+            }
+        }
         self.frame += 1;
         let now = ctx.input(|i| i.time);
         if self.first_frame.is_none() {

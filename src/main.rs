@@ -7,6 +7,7 @@ mod print;
 mod render;
 mod settings;
 mod theme;
+mod window;
 
 use std::{path::PathBuf, time::Instant};
 

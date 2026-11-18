@@ -54,6 +54,7 @@ The built app is `target\release\shorui.exe`. It needs `pdfium.dll` beside it; t
 - Find in document: matches stream in as pages are searched, ignoring line breaks, with match case and whole-word options. Every match is listed with the words around it in the sidebar's Results tab.
 - Select text by dragging, double-click a word, copy with Ctrl+C. Middle or right drag pans.
 - Remembers the page and zoom of every file you open, not just the last session's tabs. The start screen shows recent files with their first page, how far you got and when; pin the ones you keep coming back to. Ctrl+Shift+T reopens a tab you closed.
+- Opens where you left the window: same size and place, maximized if it was (including when you closed it from the taskbar while minimized). If that spot is on a monitor that is no longer there, it opens on the main one.
 - Night reading (N) draws pages light on dark, keeping their colours.
 - Presentation mode (F5): full screen, one page at a time; arrows, Space, a click or the wheel move on, Esc leaves.
 - Scanned PDFs: pages with no text are read with OCR, so find, select, copy and annotations work on them too. An optional neural engine reads poor scans much better (see below).

@@ -62,6 +62,8 @@ pub struct Settings {
     pub ocr_engine: Kind,
     /// Pages drawn light on dark.
     pub night: bool,
+    /// Where the window was when Shorui last closed.
+    pub window: Option<crate::window::Placement>,
     /// Most recently opened files, newest first.
     pub recent: Vec<Recent>,
     /// The tabs open when Shorui last closed: file, page and zoom.
@@ -78,6 +80,7 @@ impl Default for Settings {
             ocr: true,
             ocr_engine: Kind::Windows,
             night: false,
+            window: None,
             recent: Vec::new(),
             session: Vec::new(),
         }
@@ -115,6 +118,7 @@ impl Settings {
                 ("ocr", v) => s.ocr = v == "true",
                 ("ocr_engine", v) => s.ocr_engine = Kind::from_key(v).unwrap_or(Kind::Windows),
                 ("night", v) => s.night = v == "true",
+                ("window", v) => s.window = crate::window::Placement::from_setting(v),
                 ("recent", v) if !v.is_empty() => {
                     // file|page|zoom|pages|opened|pinned, or just the file (before 0.5).
                     let parts: Vec<&str> = if v.matches('|').count() == 5 { v.rsplitn(6, '|').collect() } else { vec![v] };
@@ -163,6 +167,9 @@ impl Settings {
         let mut text = text;
         text += &format!("restore_session={}\ntwo_page={}\nocr={}\n", self.restore_session, self.two_page, self.ocr);
         text += &format!("ocr_engine={}\nnight={}\n", self.ocr_engine.key(), self.night);
+        if let Some(w) = self.window {
+            text += &format!("window={}\n", w.to_setting());
+        }
         for r in &self.recent {
             text += &format!(
                 "recent={}|{}|{}|{}|{}|{}\n",
