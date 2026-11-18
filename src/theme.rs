@@ -188,6 +188,11 @@ pub enum Icon {
     Down,
     Highlighter,
     Gear,
+    Undo,
+    Redo,
+    Print,
+    Pen,
+    TwoPage,
 }
 
 /// Draws a 16px outline icon centred on `c` with a 1.5px stroke.
@@ -270,6 +275,31 @@ pub fn paint_icon(p: &Painter, c: Pos2, icon: Icon, color: Color32) {
         }
         Icon::Up => poly(&[(-4.5, 2.5), (0.0, -2.5), (4.5, 2.5)]),
         Icon::Down => poly(&[(-4.5, -2.5), (0.0, 2.5), (4.5, -2.5)]),
+        Icon::Undo | Icon::Redo => {
+            let f = if icon == Icon::Undo { 1.0 } else { -1.0 };
+            // An arrow that leaves to one side and hooks back underneath.
+            poly(&[(f * -2.5, -6.0), (f * -6.0, -2.5), (f * -2.5, 1.0)]);
+            let mut pts = vec![at(f * -6.0, -2.5), at(f * 1.5, -2.5)];
+            for i in 0..=10 {
+                let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / 10.0;
+                pts.push(at(f * (1.5 + 4.25 * a.cos()), 1.75 + 4.25 * a.sin()));
+            }
+            pts.push(at(f * -3.0, 6.0));
+            p.line(pts, s);
+        }
+        Icon::Print => {
+            poly(&[(-4.0, -3.0), (-4.0, -7.0), (4.0, -7.0), (4.0, -3.0)]);
+            outline((-7.0, -3.0), (7.0, 3.5), 2);
+            poly(&[(-4.0, 1.0), (-4.0, 7.0), (4.0, 7.0), (4.0, 1.0), (-4.0, 1.0)]);
+        }
+        Icon::Pen => {
+            poly(&[(-6.5, 6.5), (-5.5, 2.5), (3.5, -6.5), (6.5, -3.5), (-2.5, 5.5), (-6.5, 6.5)]);
+            seg((1.5, -4.5), (4.5, -1.5));
+        }
+        Icon::TwoPage => {
+            outline((-7.5, -6.0), (-1.0, 6.0), 1);
+            outline((1.0, -6.0), (7.5, 6.0), 1);
+        }
         Icon::Gear => {
             p.circle_stroke(c, 2.4, s);
             p.circle_stroke(c, 5.2, s);

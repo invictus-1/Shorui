@@ -12,7 +12,7 @@ use egui::{
 };
 
 use crate::{
-    render::{DocId, Gens, PageText, Req, Resp, TILE, line_rects},
+    render::{DocId, Edit, Gens, Link, Markup, OutlineItem, PageText, Req, Resp, TILE, line_rects},
     settings::{self, OpenZoom, Settings, Update},
     theme::{self, Icon, *},
 };
@@ -105,6 +105,28 @@ struct DocView {
     page_field: String,
     side_view: (f32, f32),
     side_scroll_to: Option<u32>,
+    outline: Vec<OutlineItem>,
+    can_undo: bool,
+    can_redo: bool,
+    /// Page and zoom to return to, from the last session.
+    restore: Option<(u32, f32)>,
+    /// The pen stroke being drawn: page and points in page points.
+    stroke: Option<(u32, Vec<[f32; 2]>)>,
+
+    /// Layout rows: one page each, or two side by side in two-page view.
+    two_page: bool,
+    row_of: Vec<u32>,
+    col: Vec<u8>,
+    row_first: Vec<u32>,
+    row_count: Vec<u8>,
+    /// Sum of row heights before row r, in points. Length rows + 1.
+    row_top: Vec<f32>,
+    row_w: Vec<f32>,
+    max_row_w: f32,
+
+    /// Thumbnails being dragged to a new place, and where they would land.
+    drag_pages: Option<Vec<u32>>,
+    drop_before: Option<u32>,
 
     texts: HashMap<u32, Arc<PageText>>,
     text_pending: HashSet<u32>,
@@ -161,6 +183,21 @@ impl DocView {
             page_field: "1".into(),
             side_view: (0.0, 0.0),
             side_scroll_to: None,
+            outline: Vec::new(),
+            can_undo: false,
+            can_redo: false,
+            restore: None,
+            stroke: None,
+            two_page: false,
+            row_of: Vec::new(),
+            col: Vec::new(),
+            row_first: Vec::new(),
+            row_count: Vec::new(),
+            row_top: vec![0.0],
+            row_w: Vec::new(),
+            max_row_w: 1.0,
+            drag_pages: None,
+            drop_before: None,
             texts: HashMap::new(),
             text_pending: HashSet::new(),
             sel: None,
@@ -195,6 +232,7 @@ impl DocView {
         self.side_prefix.push(side);
         self.max_w = max_w;
         self.sizes = sizes;
+        self.relayout();
         self.epoch = epoch;
         self.tiles.clear();
         self.tile_bytes = 0;
@@ -219,35 +257,79 @@ impl DocView {
         vec2(s[0], s[1]) * (self.zoom * PT)
     }
 
+    /// Groups pages into rows: singles, or pairs in two-page view.
+    fn relayout(&mut self) {
+        let n = self.sizes.len();
+        self.row_of.clear();
+        self.col.clear();
+        self.row_first.clear();
+        self.row_count.clear();
+        self.row_w.clear();
+        self.row_top = vec![0.0];
+        let (mut i, mut acc, mut max_w) = (0, 0.0f32, 1.0f32);
+        while i < n {
+            let count = if self.two_page && i + 1 < n { 2 } else { 1 };
+            let w: f32 = (0..count).map(|k| self.sizes[i + k][0]).sum();
+            let h = (0..count).map(|k| self.sizes[i + k][1]).fold(0.0, f32::max);
+            let row = self.row_first.len() as u32;
+            self.row_first.push(i as u32);
+            self.row_count.push(count as u8);
+            for k in 0..count {
+                self.row_of.push(row);
+                self.col.push(k as u8);
+            }
+            self.row_w.push(w);
+            acc += h;
+            self.row_top.push(acc);
+            max_w = max_w.max(w);
+            i += count;
+        }
+        self.max_row_w = max_w;
+    }
+
     fn top(&self, i: u32, zoom: f32) -> f32 {
-        MARGIN + GAP * i as f32 + self.prefix[i as usize] * zoom * PT
+        let row = self.row_of[i as usize] as usize;
+        MARGIN + GAP * row as f32 + self.row_top[row] * zoom * PT
     }
 
     fn total_h(&self) -> f32 {
-        let n = self.n();
-        2.0 * MARGIN + GAP * n.saturating_sub(1) as f32 + self.prefix[n as usize] * self.zoom * PT
+        let rows = self.row_first.len();
+        2.0 * MARGIN + GAP * rows.saturating_sub(1) as f32 + self.row_top[rows] * self.zoom * PT
+    }
+
+    fn pair_gap(&self) -> f32 {
+        if self.two_page { GAP } else { 0.0 }
     }
 
     fn content_w(&self, zoom: f32) -> f32 {
-        (self.max_w * zoom * PT + 2.0 * MARGIN).max(self.view.x)
+        (self.max_row_w * zoom * PT + self.pair_gap() + 2.0 * MARGIN).max(self.view.x)
     }
 
-    /// The page whose band (page plus the gap below it) contains content y.
+    /// The left edge of a page in content coordinates. Rows are centred.
+    fn page_x(&self, i: u32, zoom: f32) -> f32 {
+        let row = self.row_of[i as usize] as usize;
+        let gap = if self.row_count[row] == 2 { GAP } else { 0.0 };
+        let left = (self.content_w(zoom) - (self.row_w[row] * zoom * PT + gap)) / 2.0;
+        if self.col[i as usize] == 1 { left + self.sizes[i as usize - 1][0] * zoom * PT + GAP } else { left }
+    }
+
+    /// The first page of the row whose band (row plus the gap below it) contains content y.
     fn page_at(&self, y: f32) -> u32 {
-        let n = self.n();
-        if n == 0 {
+        let rows = self.row_first.len();
+        if rows == 0 {
             return 0;
         }
-        let (mut lo, mut hi) = (0u32, n - 1);
+        let top = |r: usize| MARGIN + GAP * r as f32 + self.row_top[r] * self.zoom * PT;
+        let (mut lo, mut hi) = (0usize, rows - 1);
         while lo < hi {
             let mid = (lo + hi + 1) / 2;
-            if self.top(mid, self.zoom) <= y {
+            if top(mid) <= y {
                 lo = mid;
             } else {
                 hi = mid - 1;
             }
         }
-        lo
+        self.row_first[lo]
     }
 
     fn clamp_scroll(&mut self) {
@@ -289,13 +371,14 @@ impl DocView {
         if self.n() == 0 {
             return 1.0;
         }
-        let w = (self.view.x - 2.0 * MARGIN - 12.0).max(50.0);
+        let w = (self.view.x - 2.0 * MARGIN - 12.0 - self.pair_gap()).max(50.0);
         match fit {
-            Fit::Width | Fit::None => w / (self.max_w * PT),
+            Fit::Width | Fit::None => w / (self.max_row_w * PT),
             Fit::Page => {
-                let s = self.sizes[self.current as usize];
+                let row = self.row_of[self.current as usize] as usize;
+                let row_h = self.row_top[row + 1] - self.row_top[row];
                 let h = (self.view.y - 2.0 * MARGIN).max(50.0);
-                (w / (s[0] * PT)).min(h / (s[1] * PT))
+                (w / (self.row_w[row] * PT)).min(h / (row_h * PT))
             }
         }
     }
@@ -370,7 +453,7 @@ impl DocView {
         if y < self.scroll.y + 40.0 || y + (r[3] - r[1]) * k > self.scroll.y + self.view.y - 60.0 {
             self.scroll.y = y - self.view.y * 0.35;
         }
-        let x = (self.content_w(self.zoom) - self.sizes[page as usize][0] * k) / 2.0 + r[0] * k;
+        let x = self.page_x(page, self.zoom) + r[0] * k;
         if x < self.scroll.x + 20.0 || x + (r[2] - r[0]) * k > self.scroll.x + self.view.x - 40.0 {
             self.scroll.x = x - self.view.x / 2.0;
         }
@@ -451,9 +534,18 @@ enum Action {
     SearchClose,
     Copy,
     SelectAll,
-    Highlight,
+    Markup(Markup),
     Unhighlight(u32, Vec2),
     Settings,
+    Undo,
+    Redo,
+    Print,
+    TogglePen,
+    NoteAt(u32, Vec2),
+    MovePages(Vec<u32>, u32),
+    InsertPdf(u32),
+    Extract,
+    TwoPage,
 }
 
 enum Confirm {
@@ -507,6 +599,9 @@ pub struct App {
     /// True while the running check was started by the app itself, not by the user.
     quiet_check: bool,
     about_icon: Option<TextureHandle>,
+    pen: bool,
+    note_prompt: Option<(u32, Vec2, String)>,
+    side_outline: bool,
 }
 
 impl App {
@@ -568,12 +663,24 @@ impl App {
             update_rx,
             quiet_check: false,
             about_icon: None,
+            pen: false,
+            note_prompt: None,
+            side_outline: false,
         };
         for f in files {
-            app.docs.push(DocView::new(app.next_id, f));
+            let mut doc = DocView::new(app.next_id, f);
+            doc.two_page = app.settings.two_page;
+            doc.restore = app.settings.session.iter().find(|s| s.0 == doc.path).map(|s| (s.1, s.2));
+            if app.selftest.is_none() {
+                app.settings.remember(&doc.path);
+            }
+            app.docs.push(doc);
             app.next_id += 1;
         }
         app.active = app.docs.len().saturating_sub(1);
+        if app.selftest.is_none() && !app.docs.is_empty() {
+            app.settings.save();
+        }
         if app.selftest.is_none() && app.settings.auto_update && settings::now() > app.settings.last_check + 86_400 {
             app.settings.last_check = settings::now();
             app.settings.save();
@@ -610,6 +717,11 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         self.docs.push(DocView::new(id, path.clone()));
+        self.docs.last_mut().unwrap().two_page = self.settings.two_page;
+        if self.selftest.is_none() {
+            self.settings.remember(&path);
+            self.settings.save();
+        }
         let _ = self.req.send(Req::Open { id, path, password: None });
         self.activate(self.docs.len() - 1);
     }
@@ -644,7 +756,7 @@ impl App {
         while let Ok(r) = self.resp.try_recv() {
             match r {
                 Resp::Fatal(e) => self.fatal = Some(e),
-                Resp::Opened { id, sizes } => {
+                Resp::Opened { id, sizes, outline } => {
                     let opened_ms = self.t0.elapsed().as_secs_f64() * 1000.0;
                     if let Some(t) = &mut self.selftest {
                         t.log += &format!("document opened at {opened_ms:.1} ms, {} pages\n", sizes.len());
@@ -652,6 +764,7 @@ impl App {
                     if let Some(d) = self.doc_by_id(id) {
                         d.loading = false;
                         d.set_sizes(sizes, 0);
+                        d.outline = outline;
                     }
                 }
                 Resp::OpenFailed { id, error, needs_password } => {
@@ -708,26 +821,6 @@ impl App {
                         }
                     }
                 }
-                Resp::Annotated { id, epoch, pages, added } => {
-                    if let Some(d) = self.doc_by_id(id) {
-                        d.epoch = epoch;
-                        for p in &pages {
-                            if let Some(list) = d.tiles.remove(p) {
-                                d.tile_bytes -= list.iter().map(|t| t.bytes).sum::<usize>();
-                            }
-                            d.thumbs.remove(p);
-                            d.texts.remove(p);
-                            d.text_pending.remove(p);
-                        }
-                        d.dirty = true;
-                        d.complete = false;
-                        if added {
-                            d.sel = None;
-                        }
-                    }
-                    self.invalidate_requests();
-                    self.say(if added { "Highlighted." } else { "Removed highlight." }, false, now);
-                }
                 Resp::Copied(text) => {
                     self.last_copied = Some(text.clone());
                     if !text.is_empty() {
@@ -735,24 +828,45 @@ impl App {
                         self.say("Copied.", false, now);
                     }
                 }
-                Resp::Edited { id, epoch, sizes } => {
-                    {
-                        // The pages changed, so an open search runs again on the new document.
-                        let Self { docs, req, gens, .. } = self;
-                        if let Some(d) = docs.iter_mut().find(|d| d.id == id) {
-                            if d.search_open && !d.query.trim().is_empty() {
-                                start_search(d, req, gens);
+                Resp::Edited { id, epoch, sizes, outline, pages, note, can_undo, can_redo } => {
+                    let Self { docs, req, gens, .. } = self;
+                    if let Some(d) = docs.iter_mut().find(|d| d.id == id) {
+                        match pages {
+                            // Only annotations changed: redraw just those pages.
+                            Some(pages) => {
+                                d.epoch = epoch;
+                                for p in &pages {
+                                    if let Some(list) = d.tiles.remove(p) {
+                                        d.tile_bytes -= list.iter().map(|t| t.bytes).sum::<usize>();
+                                    }
+                                    d.thumbs.remove(p);
+                                    d.texts.remove(p);
+                                    d.text_pending.remove(p);
+                                }
+                                d.complete = false;
+                                d.sel = None;
+                            }
+                            // The page list changed: lay everything out again.
+                            None => {
+                                d.set_sizes(sizes, epoch);
+                                d.selected.retain(|&p| (p as usize) < d.sizes.len());
+                                d.clamp_scroll();
+                                if d.search_open && !d.query.trim().is_empty() {
+                                    start_search(d, req, gens);
+                                }
                             }
                         }
-                    }
-                    if let Some(d) = self.doc_by_id(id) {
-                        d.set_sizes(sizes, epoch);
+                        d.outline = outline;
                         d.dirty = true;
-                        d.selected.retain(|&p| (p as usize) < d.sizes.len());
-                        d.clamp_scroll();
+                        d.can_undo = can_undo;
+                        d.can_redo = can_redo;
                     }
                     self.invalidate_requests();
+                    if !note.is_empty() {
+                        self.say(note, false, now);
+                    }
                 }
+                Resp::Notice { text, error } => self.say(text, error, now),
                 Resp::EditFailed { error } => self.say(format!("Can't change this page. {error}"), true, now),
                 Resp::Saved { id, path } => {
                     let mut close = None;
@@ -782,7 +896,7 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let typing = ctx.memory(|m| m.focused().is_some());
-        let modal = self.confirm.is_some() || self.password_prompt.is_some() || self.settings_open;
+        let modal = self.confirm.is_some() || self.password_prompt.is_some() || self.settings_open || self.note_prompt.is_some();
         if modal {
             return;
         }
@@ -799,6 +913,9 @@ impl App {
             }
             if i.consume_key(Modifiers::COMMAND, Key::W) {
                 actions.push(Action::Close(self.active));
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::P) {
+                actions.push(Action::Print);
             }
             if i.consume_key(Modifiers::COMMAND, Key::Comma) {
                 actions.push(Action::Settings);
@@ -835,6 +952,9 @@ impl App {
             }
             if i.consume_key(Modifiers::COMMAND, Key::Num1) {
                 actions.push(Action::Fit(Fit::Width));
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::Num3) {
+                actions.push(Action::TwoPage);
             }
             if i.consume_key(Modifiers::COMMAND, Key::Num2) {
                 actions.push(Action::Fit(Fit::Page));
@@ -888,8 +1008,23 @@ impl App {
             if d.sel.is_some() && i.events.iter().any(|e| matches!(e, egui::Event::Copy)) {
                 actions.push(Action::Copy);
             }
+            if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z) || i.consume_key(Modifiers::COMMAND, Key::Y) {
+                actions.push(Action::Redo);
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::Z) {
+                actions.push(Action::Undo);
+            }
+            if i.consume_key(Modifiers::NONE, Key::P) {
+                actions.push(Action::TogglePen);
+            }
+            if d.sel.is_some() && i.consume_key(Modifiers::NONE, Key::U) {
+                actions.push(Action::Markup(Markup::Underline));
+            }
+            if d.sel.is_some() && i.consume_key(Modifiers::NONE, Key::S) {
+                actions.push(Action::Markup(Markup::Strikeout));
+            }
             if d.sel.is_some() && i.consume_key(Modifiers::NONE, Key::H) {
-                actions.push(Action::Highlight);
+                actions.push(Action::Markup(Markup::Highlight));
             }
             if d.sel.is_some() && i.consume_key(Modifiers::NONE, Key::Escape) {
                 d.sel = None;
@@ -983,17 +1118,89 @@ impl App {
                         }
                     }
                 }
-                Action::Highlight => {
+                Action::Markup(kind) => {
                     if let Some(d) = self.docs.get(self.active) {
                         if let Some((from, to)) = d.sel_range() {
-                            let color = self.settings.highlight_rgb();
-                            let _ = self.req.send(Req::Highlight { id: d.id, from, to, color });
+                            let color = match kind {
+                                Markup::Highlight => self.settings.highlight_rgb(),
+                                Markup::Underline => [124, 58, 237],
+                                Markup::Strikeout => [229, 72, 77],
+                            };
+                            let _ = self.req.send(Req::Edit { id: d.id, edit: Edit::Markup { kind, from, to, color } });
                         }
                     }
                 }
                 Action::Unhighlight(page, at) => {
                     if let Some(d) = self.docs.get(self.active) {
-                        let _ = self.req.send(Req::Unhighlight { id: d.id, page, at: [at.x, at.y] });
+                        let _ = self.req.send(Req::Edit { id: d.id, edit: Edit::RemoveAnnot { page, at: [at.x, at.y] } });
+                    }
+                }
+                Action::Undo => {
+                    if let Some(d) = self.docs.get(self.active) {
+                        let _ = self.req.send(Req::Undo { id: d.id });
+                    }
+                }
+                Action::Redo => {
+                    if let Some(d) = self.docs.get(self.active) {
+                        let _ = self.req.send(Req::Redo { id: d.id });
+                    }
+                }
+                Action::Print => {
+                    if let Some(d) = self.docs.get(self.active).filter(|d| !d.loading && d.n() > 0) {
+                        // The dialog runs on its own thread so the document keeps rendering.
+                        let (req, id, pages) = (self.req.clone(), d.id, d.n());
+                        std::thread::spawn(move || {
+                            if let Some(job) = crate::print::dialog(pages) {
+                                let _ = req.send(Req::Print { id, job });
+                            }
+                        });
+                    }
+                }
+                Action::TogglePen => {
+                    self.pen = !self.pen;
+                    if let Some(d) = self.doc() {
+                        d.sel = None;
+                        d.stroke = None;
+                    }
+                }
+                Action::NoteAt(page, at) => self.note_prompt = Some((page, at, String::new())),
+                Action::MovePages(pages, before) => {
+                    if let Some(d) = self.doc() {
+                        d.selected.clear();
+                        let (id, edit) = (d.id, Edit::Move { pages, before });
+                        let _ = self.req.send(Req::Edit { id, edit });
+                    }
+                }
+                Action::InsertPdf(at) => {
+                    let Some(id) = self.docs.get(self.active).map(|d| d.id) else { continue };
+                    if let Some(path) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_file() {
+                        let _ = self.req.send(Req::Edit { id, edit: Edit::Insert { path, at } });
+                    }
+                }
+                Action::Extract => {
+                    let Some(d) = self.docs.get(self.active) else { continue };
+                    let pages = d.targets();
+                    let stem = d.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    let mut dialog =
+                        rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(format!("{stem} pages.pdf"));
+                    if let Some(dir) = d.path.parent() {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    if let Some(path) = dialog.save_file() {
+                        let _ = self.req.send(Req::Extract { id: d.id, pages, path });
+                    }
+                }
+                Action::TwoPage => {
+                    self.settings.two_page = !self.settings.two_page;
+                    self.settings.save();
+                    let two = self.settings.two_page;
+                    for d in &mut self.docs {
+                        let page = d.current;
+                        d.two_page = two;
+                        if !d.loading && d.n() > 0 {
+                            d.relayout();
+                            d.go_to(page);
+                        }
                     }
                 }
                 Action::SelectAll => {
@@ -1039,7 +1246,7 @@ impl App {
                 Action::Rotate(clockwise) => {
                     if let Some(d) = self.docs.get(self.active) {
                         if !d.loading && d.n() > 0 {
-                            let _ = self.req.send(Req::Rotate { id: d.id, pages: d.targets(), clockwise });
+                            let _ = self.req.send(Req::Edit { id: d.id, edit: Edit::Rotate { pages: d.targets(), clockwise } });
                         }
                     }
                 }
@@ -1055,7 +1262,7 @@ impl App {
                     }
                     let count = pages.len();
                     d.selected.clear();
-                    let _ = self.req.send(Req::Delete { id: d.id, pages });
+                    let _ = self.req.send(Req::Edit { id: d.id, edit: Edit::Delete { pages } });
                     self.say(if count == 1 { "Deleted 1 page.".into() } else { format!("Deleted {count} pages.") }, false, now);
                 }
             }
@@ -1127,7 +1334,7 @@ impl App {
     }
 
     fn toolbar(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        let Self { docs, active, req, gens, .. } = self;
+        let Self { docs, active, req, gens, pen, .. } = self;
         let doc = docs.get_mut(*active).filter(|d| !d.loading && d.error.is_none() && d.n() > 0);
         let has = doc.is_some();
         ui.horizontal_centered(|ui| {
@@ -1144,6 +1351,15 @@ impl App {
                 actions.push(Action::Save);
             }
             let Some(d) = doc else { return };
+            if theme::icon_button(ui, Icon::Undo, "Undo  Ctrl+Z", d.can_undo, false).clicked() && d.can_undo {
+                actions.push(Action::Undo);
+            }
+            if theme::icon_button(ui, Icon::Redo, "Redo  Ctrl+Y", d.can_redo, false).clicked() && d.can_redo {
+                actions.push(Action::Redo);
+            }
+            if theme::icon_button(ui, Icon::Print, "Print  Ctrl+P", true, false).clicked() {
+                actions.push(Action::Print);
+            }
             sep(ui);
 
             // Page readout: editable current page and the page count.
@@ -1198,6 +1414,9 @@ impl App {
             if theme::icon_button(ui, Icon::FitPage, "Fit page  Ctrl+2", true, d.fit == Fit::Page).clicked() {
                 actions.push(Action::Fit(if d.fit == Fit::Page { Fit::None } else { Fit::Page }));
             }
+            if theme::icon_button(ui, Icon::TwoPage, "Two pages side by side  Ctrl+3", true, d.two_page).clicked() {
+                actions.push(Action::TwoPage);
+            }
             sep(ui);
 
             let what = match d.selected.len() {
@@ -1216,7 +1435,10 @@ impl App {
             }
             let has_sel = d.sel.is_some();
             if theme::icon_button(ui, Icon::Highlighter, "Highlight selected text  H", has_sel, false).clicked() && has_sel {
-                actions.push(Action::Highlight);
+                actions.push(Action::Markup(Markup::Highlight));
+            }
+            if theme::icon_button(ui, Icon::Pen, "Draw  P", true, *pen).clicked() {
+                actions.push(Action::TogglePen);
             }
             sep(ui);
 
@@ -1264,13 +1486,78 @@ impl App {
     }
 
     fn sidebar(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        let Some(d) = self.docs.get_mut(self.active) else { return };
+        let Self { docs, active, side_outline, .. } = self;
+        let Some(d) = docs.get_mut(*active) else { return };
         if d.loading || d.n() == 0 {
             return;
         }
         let n = d.n();
-        let total = d.side_prefix[n as usize];
         let width = ui.available_width();
+
+        // Pages or outline, when the document has an outline.
+        if !d.outline.is_empty() {
+            ui.add_space(SPACE_2);
+            ui.horizontal(|ui| {
+                ui.add_space(SPACE_2);
+                ui.spacing_mut().item_spacing.x = SPACE_1;
+                for (outline, text) in [(false, "Pages"), (true, "Outline")] {
+                    let on = *side_outline == outline;
+                    let (rect, resp) = ui.allocate_exact_size(vec2((width - 20.0) / 2.0, 26.0), Sense::click());
+                    if on {
+                        ui.painter().rect_filled(rect, CornerRadius::same(RADIUS_MD), ACCENT_DEEP);
+                    } else if resp.hovered() {
+                        ui.painter().rect_filled(rect, CornerRadius::same(RADIUS_MD), BG_300);
+                    }
+                    let color = if on || resp.hovered() { INK } else { INK_MUTED };
+                    ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, theme::label(), color);
+                    if resp.clicked() {
+                        *side_outline = outline;
+                    }
+                }
+            });
+            ui.add_space(SPACE_1);
+        }
+        if *side_outline && !d.outline.is_empty() {
+            let current = d.current;
+            // The entry being read: the last one that starts at or before the current page.
+            let reading = d.outline.iter().rposition(|o| o.page.is_some_and(|p| p <= current));
+            egui::ScrollArea::vertical().id_salt(("outline", d.id)).auto_shrink(false).show_rows(
+                ui,
+                26.0,
+                d.outline.len(),
+                |ui, range| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for i in range {
+                        let item = &d.outline[i];
+                        let (rect, resp) = ui.allocate_exact_size(vec2(width, 26.0), Sense::click());
+                        let row = rect.shrink2(vec2(SPACE_1, 1.0));
+                        if reading == Some(i) {
+                            ui.painter().rect_filled(row, CornerRadius::same(RADIUS_MD), ACCENT_DEEP);
+                        } else if resp.hovered() {
+                            ui.painter().rect_filled(row, CornerRadius::same(RADIUS_MD), BG_300);
+                        }
+                        let x = row.min.x + SPACE_2 + item.depth as f32 * 12.0;
+                        let color = if reading == Some(i) || resp.hovered() { INK } else { INK_MUTED };
+                        ui.painter().with_clip_rect(row.shrink2(vec2(SPACE_1, 0.0))).text(
+                            pos2(x, row.center().y),
+                            Align2::LEFT_CENTER,
+                            &item.title,
+                            theme::body(),
+                            color,
+                        );
+                        if resp.clicked() {
+                            if let Some(page) = item.page {
+                                actions.push(Action::GoTo(page));
+                            }
+                        }
+                        resp.on_hover_text(&item.title);
+                    }
+                },
+            );
+            return;
+        }
+
+        let total = d.side_prefix[n as usize];
         let mut area = egui::ScrollArea::vertical().id_salt(("thumbs", d.id)).auto_shrink(false);
         if let Some(p) = d.side_scroll_to.take() {
             let top = d.side_prefix[p as usize];
@@ -1281,6 +1568,7 @@ impl App {
             }
         }
         let (modifiers, ppp) = (ui.input(|i| i.modifiers), ui.ctx().pixels_per_point());
+        let (pointer, down) = ui.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down()));
         area.show_viewport(ui, |ui, vp| {
             ui.set_height(total);
             ui.set_width(width);
@@ -1294,10 +1582,11 @@ impl App {
                 let min = pos2((min.x * ppp).round() / ppp, (min.y * ppp).round() / ppp);
                 let cell = Rect::from_min_size(min, vec2(SIDE_CELL, h));
                 let hit = Rect::from_min_max(cell.min - Vec2::splat(4.0), pos2(cell.max.x + 4.0, cell.max.y + SIDE_LABEL));
-                let resp = ui.interact(hit, Id::unique(("thumb", d.id, i)), Sense::click());
+                let resp = ui.interact(hit, Id::unique(("thumb", d.id, i)), Sense::click_and_drag());
                 let p = ui.painter();
                 let selected = d.selected.contains(&i);
                 let current = d.current == i;
+                let dragged = d.drag_pages.as_ref().is_some_and(|l| l.contains(&i));
                 if selected {
                     p.rect_filled(hit, CornerRadius::same(RADIUS_MD), ACCENT_DEEP);
                 } else if resp.hovered() {
@@ -1305,7 +1594,8 @@ impl App {
                 }
                 match d.thumbs.get(&i) {
                     Some(t) => {
-                        p.image(t.id(), cell, UV, Color32::WHITE);
+                        let tint = if dragged { Color32::from_gray(110) } else { Color32::WHITE };
+                        p.image(t.id(), cell, UV, tint);
                     }
                     None => {
                         p.rect_filled(cell, CornerRadius::same(RADIUS_SM), BG_300);
@@ -1342,14 +1632,74 @@ impl App {
                         actions.push(Action::GoTo(i));
                     }
                 }
+                // Drag a thumbnail (or the whole selection) to move pages.
+                if resp.drag_started_by(egui::PointerButton::Primary) {
+                    d.drag_pages =
+                        Some(if selected { d.selected.iter().copied().collect() } else { vec![i] });
+                }
+                // Page actions on right-click act on the selection, or on this page.
+                if resp.secondary_clicked() && !selected {
+                    d.selected.clear();
+                    d.selected.insert(i);
+                    d.select_anchor = i;
+                }
+                let count = d.selected.len().max(1);
+                egui::Popup::context_menu(&resp).show(|ui| {
+                    ui.set_min_width(200.0);
+                    let item = |text: &str| egui::Button::new(RichText::new(text).font(theme::body()));
+                    if ui.add(item("Rotate left")).clicked() {
+                        actions.push(Action::Rotate(false));
+                    }
+                    if ui.add(item("Rotate right")).clicked() {
+                        actions.push(Action::Rotate(true));
+                    }
+                    if ui.add_enabled(n > 1, item(if count == 1 { "Delete page" } else { "Delete pages" })).clicked() {
+                        actions.push(Action::Delete);
+                    }
+                    ui.separator();
+                    let extract = if count == 1 { "Extract page".to_string() } else { format!("Extract {count} pages") };
+                    if ui.add(item(&extract)).clicked() {
+                        actions.push(Action::Extract);
+                    }
+                    if ui.add(item("Insert PDF before")).clicked() {
+                        actions.push(Action::InsertPdf(i));
+                    }
+                    if ui.add(item("Insert PDF after")).clicked() {
+                        actions.push(Action::InsertPdf(i + 1));
+                    }
+                });
                 d.thumb_wanted.push(i);
                 i += 1;
+            }
+
+            // While dragging: show where the pages would land, and drop them on release.
+            if d.drag_pages.is_some() {
+                if let Some(pos) = pointer {
+                    let y = pos.y - origin.y;
+                    let before = (0..n as usize)
+                        .take_while(|&k| (d.side_prefix[k] + d.side_prefix[k + 1]) / 2.0 < y)
+                        .count() as u32;
+                    d.drop_before = Some(before);
+                    let line_y = origin.y + d.side_prefix[before as usize] - SPACE_1;
+                    ui.painter().hline(
+                        (origin.x + SPACE_3)..=(origin.x + width - SPACE_3),
+                        line_y,
+                        Stroke::new(2.0, ACCENT_BRIGHT),
+                    );
+                    ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                }
+                if !down {
+                    if let (Some(pages), Some(before)) = (d.drag_pages.take(), d.drop_before.take()) {
+                        actions.push(Action::MovePages(pages, before));
+                    }
+                }
             }
         });
     }
 
     fn empty_state(&mut self, ui: &mut Ui, rect: Rect, actions: &mut Vec<Action>) {
-        let c = rect.center();
+        let recent: Vec<PathBuf> = self.settings.recent.iter().filter(|p| p.exists()).take(6).cloned().collect();
+        let c = rect.center() - vec2(0.0, recent.len() as f32 * 16.0);
         let p = ui.painter();
         if let Some(e) = &self.fatal {
             p.text(c, Align2::CENTER_CENTER, e, theme::body(), DANGER);
@@ -1368,6 +1718,35 @@ impl App {
         if resp.clicked() {
             actions.push(Action::OpenDialog);
         }
+
+        // Recent files, newest first.
+        if recent.is_empty() {
+            return;
+        }
+        let mut y = button.max.y + 32.0;
+        ui.painter().text(pos2(c.x, y), Align2::CENTER_CENTER, "Recent", theme::label(), INK_MUTED);
+        y += SPACE_4;
+        for path in recent {
+            let row = Rect::from_min_size(pos2(c.x - 190.0, y), vec2(380.0, 30.0));
+            let resp = ui.interact(row, Id::unique(("recent", &path)), Sense::click());
+            let p = ui.painter();
+            if resp.hovered() {
+                p.rect_filled(row, CornerRadius::same(RADIUS_MD), BG_300);
+            }
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            p.with_clip_rect(row.shrink2(vec2(SPACE_3, 0.0))).text(
+                pos2(row.min.x + SPACE_3, row.center().y),
+                Align2::LEFT_CENTER,
+                name,
+                theme::body(),
+                if resp.hovered() { INK } else { INK_MUTED },
+            );
+            if resp.clicked() {
+                actions.push(Action::Open(path.clone()));
+            }
+            resp.on_hover_text(path.display().to_string());
+            y += 32.0;
+        }
     }
 
     fn viewer(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
@@ -1381,7 +1760,8 @@ impl App {
         let ppp = ui.ctx().pixels_per_point();
         let now = ui.input(|i| i.time);
         let frame = self.frame;
-        let Self { docs, req, gens, active, settings, .. } = self;
+        let Self { docs, req, gens, active, settings, pen, .. } = self;
+        let pen = *pen;
         let Some(d) = docs.get_mut(*active) else { return };
         let painter = ui.painter_at(rect);
         if let Some(e) = &d.error {
@@ -1402,10 +1782,15 @@ impl App {
         d.view = rect.size();
         if d.needs_fit {
             d.needs_fit = false;
-            match settings.open_zoom {
-                OpenZoom::FitWidth => d.zoom = d.fit_zoom(Fit::Width).clamp(MIN_ZOOM, 1.5),
-                OpenZoom::FitPage => d.fit = Fit::Page,
-                OpenZoom::Actual => d.zoom = 1.0,
+            if let Some((page, zoom)) = d.restore.take() {
+                d.zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+                d.go_to(page);
+            } else {
+                match settings.open_zoom {
+                    OpenZoom::FitWidth => d.zoom = d.fit_zoom(Fit::Width).clamp(MIN_ZOOM, 1.5),
+                    OpenZoom::FitPage => d.fit = Fit::Page,
+                    OpenZoom::Actual => d.zoom = 1.0,
+                }
             }
         }
         if d.fit != Fit::None {
@@ -1480,11 +1865,10 @@ impl App {
         let mut vis: Vec<(u32, Rect)> = Vec::new();
         let mut complete = d.render_scale == target;
         let view_center = rect.center();
-        let content_w = d.content_w(d.zoom);
         let mut i = d.page_at((d.scroll.y - PREFETCH).max(0.0));
         while i < n && d.top(i, d.zoom) < d.scroll.y + d.view.y + PREFETCH {
             let size = d.page_size(i);
-            let x = rect.min.x + (content_w - size.x) / 2.0 - d.scroll.x;
+            let x = rect.min.x + d.page_x(i, d.zoom) - d.scroll.x;
             let y = rect.min.y + d.top(i, d.zoom) - d.scroll.y;
             let min = pos2((x * ppp).round() / ppp, (y * ppp).round() / ppp);
             let prect = Rect::from_min_size(min, size);
@@ -1583,8 +1967,25 @@ impl App {
             char_at(text, (pos - prect.min) / k_cur, snap).map(|c| (page, c))
         };
         let pointer = resp.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.hover_pos()));
-        if resp.hovered() && !panning && pointer.is_some_and(|p| locate(d, p, false).is_some()) {
-            ui.ctx().set_cursor_icon(CursorIcon::Text);
+        // What is under the pointer: page position, and any link or note there.
+        let here = pointer.and_then(|pos| {
+            vis.iter().copied().find(|(_, r)| r.contains(pos)).map(|(page, r)| (page, (pos - r.min) / k_cur))
+        });
+        let inside = |r: &[f32; 4], at: Vec2| at.x >= r[0] && at.x <= r[2] && at.y >= r[1] && at.y <= r[3];
+        let link = here.and_then(|(page, at)| {
+            d.texts.get(&page)?.links.iter().find(|(r, _)| inside(r, at)).map(|(_, l)| l.clone())
+        });
+        let note = here.and_then(|(page, at)| {
+            d.texts.get(&page)?.notes.iter().find(|(r, _)| inside(r, at)).map(|(_, t)| t.clone())
+        });
+        if resp.hovered() && !panning {
+            if pen {
+                ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+            } else if link.is_some() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            } else if pointer.is_some_and(|p| locate(d, p, false).is_some()) {
+                ui.ctx().set_cursor_icon(CursorIcon::Text);
+            }
         }
         if resp.clicked() || resp.drag_started() {
             // Clicking the document takes the keyboard back from any text field.
@@ -1596,6 +1997,17 @@ impl App {
         }
         if resp.clicked() {
             d.sel = None;
+            match &link {
+                Some(Link::Page(p)) if !pen => d.go_to(*p),
+                // Only ordinary web and mail links are opened; anything else is ignored.
+                Some(Link::Uri(u)) if !pen => {
+                    let lower = u.to_lowercase();
+                    if lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:") {
+                        crate::settings::open_url(u);
+                    }
+                }
+                _ => {}
+            }
         }
 
         // Right-click menu. The click position is kept so "Remove highlight" knows its target.
@@ -1607,20 +2019,34 @@ impl App {
         }
         let over_highlight = d.menu_at.filter(|(page, at)| {
             d.texts.get(page).is_some_and(|t| {
-                t.highlights.iter().any(|h| at.x >= h[0] && at.x <= h[2] && at.y >= h[1] && at.y <= h[3])
+                t.marks.iter().any(|h| at.x >= h[0] && at.x <= h[2] && at.y >= h[1] && at.y <= h[3])
             })
         });
         let has_sel = d.sel.is_some();
+        let menu_at = d.menu_at;
         egui::Popup::context_menu(&resp).show(|ui| {
-            ui.set_min_width(190.0);
+            ui.set_min_width(210.0);
             let item = |text: &str| egui::Button::new(RichText::new(text).font(theme::body()));
             if ui.add_enabled(has_sel, item("Copy    Ctrl+C")).clicked() {
                 actions.push(Action::Copy);
             }
+            ui.separator();
             if ui.add_enabled(has_sel, item("Highlight    H")).clicked() {
-                actions.push(Action::Highlight);
+                actions.push(Action::Markup(Markup::Highlight));
             }
-            if ui.add_enabled(over_highlight.is_some(), item("Remove highlight")).clicked() {
+            if ui.add_enabled(has_sel, item("Underline    U")).clicked() {
+                actions.push(Action::Markup(Markup::Underline));
+            }
+            if ui.add_enabled(has_sel, item("Strike out    S")).clicked() {
+                actions.push(Action::Markup(Markup::Strikeout));
+            }
+            if ui.add_enabled(menu_at.is_some(), item("Add note here")).clicked() {
+                if let Some((page, at)) = menu_at {
+                    actions.push(Action::NoteAt(page, at));
+                }
+            }
+            ui.separator();
+            if ui.add_enabled(over_highlight.is_some(), item("Remove annotation")).clicked() {
                 if let Some((page, at)) = over_highlight {
                     actions.push(Action::Unhighlight(page, at));
                 }
@@ -1634,9 +2060,28 @@ impl App {
         }
         if resp.drag_started_by(egui::PointerButton::Primary) {
             let origin = ui.input(|i| i.pointer.press_origin()).or(pointer);
-            let hit = origin.and_then(|p| locate(d, p, true));
-            d.sel = hit.map(|h| (h, h));
-            d.selecting = hit.is_some();
+            if pen {
+                // Start a stroke on the page under the pointer.
+                d.sel = None;
+                d.stroke = origin.and_then(|pos| {
+                    let (page, r) = vis.iter().copied().find(|(_, r)| r.contains(pos))?;
+                    let at = (pos - r.min) / k_cur;
+                    Some((page, vec![[at.x, at.y]]))
+                });
+            } else {
+                let hit = origin.and_then(|p| locate(d, p, true));
+                d.sel = hit.map(|h| (h, h));
+                d.selecting = hit.is_some();
+            }
+        }
+        if let (Some((page, points)), Some(pos), true) = (&mut d.stroke, pointer, resp.dragged_by(egui::PointerButton::Primary)) {
+            if let Some((_, r)) = vis.iter().find(|(p, _)| p == page) {
+                let at = (pos.clamp(r.min, r.max) - r.min) / k_cur;
+                let far = points.last().is_none_or(|l| (l[0] - at.x).abs() + (l[1] - at.y).abs() > 0.75);
+                if far {
+                    points.push([at.x, at.y]);
+                }
+            }
         }
         if d.selecting && resp.dragged_by(egui::PointerButton::Primary) {
             if let Some(pos) = pointer {
@@ -1657,6 +2102,19 @@ impl App {
         }
         if resp.drag_stopped() {
             d.selecting = false;
+            if let Some((page, points)) = d.stroke.take() {
+                if points.len() > 1 {
+                    let edit = Edit::Ink { page, points, color: [124, 58, 237], width: 2.0 };
+                    let _ = req.send(Req::Edit { id: d.id, edit });
+                }
+            }
+        }
+        if let Some((page, points)) = &d.stroke {
+            // The stroke in progress, drawn where the saved one will land.
+            if let Some((_, r)) = vis.iter().find(|(p, _)| p == page) {
+                let line: Vec<egui::Pos2> = points.iter().map(|p| r.min + vec2(p[0], p[1]) * k_cur).collect();
+                painter.line(line, Stroke::new((2.0 * k_cur).max(1.0), ACCENT));
+            }
         }
 
         let on_page = |prect: Rect, r: &[f32; 4]| {
@@ -1695,6 +2153,24 @@ impl App {
                     }
                 }
             }
+        }
+
+        // A note's text, or a link's address, shown beside the pointer.
+        let tip = note.or(match &link {
+            Some(Link::Uri(u)) => Some(u.clone()),
+            Some(Link::Page(p)) => Some(format!("Go to page {}", p + 1)),
+            None => None,
+        });
+        if let (Some(text), Some(pos), true) = (tip, pointer, resp.hovered() && !resp.dragged() && !pen) {
+            let tip_painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::unique("page-tip")));
+            let galley = tip_painter.layout(text, theme::body(), INK, 320.0);
+            let size = galley.size() + vec2(SPACE_3 * 2.0, SPACE_2 * 2.0);
+            let mut min = pos + vec2(14.0, 18.0);
+            min.x = min.x.min(rect.max.x - size.x - 4.0);
+            min.y = min.y.min(rect.max.y - size.y - 4.0);
+            let tip_rect = Rect::from_min_size(min, size);
+            tip_painter.rect(tip_rect, CornerRadius::same(RADIUS_MD), BG_300, Stroke::new(1.0, LINE_STRONG), StrokeKind::Inside);
+            tip_painter.galley(tip_rect.min + vec2(SPACE_3, SPACE_2), galley, INK);
         }
 
         // Request what is missing, nearest the centre first. Anything queued that is no longer
@@ -1792,6 +2268,10 @@ impl App {
                     }
                 }
             });
+            ui.checkbox(
+                &mut self.settings.restore_session,
+                RichText::new("Reopen the last tabs when Shorui starts").font(theme::body()),
+            );
             if ui.checkbox(&mut self.settings.sidebar, RichText::new("Show page thumbnails").font(theme::body())).changed() {
                 self.sidebar = self.settings.sidebar;
             }
@@ -1897,6 +2377,41 @@ impl App {
     }
 
     fn modals(&mut self, ctx: &egui::Context) {
+        if let Some((page, at, text)) = &mut self.note_prompt {
+            let (page, at) = (*page, *at);
+            let mut choice = 0;
+            let modal = egui::Modal::new(Id::unique("note")).frame(theme::modal_frame()).show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.label(RichText::new("Add note").font(theme::title()));
+                let field = ui.add(
+                    egui::TextEdit::multiline(text).desired_rows(4).desired_width(f32::INFINITY).font(theme::body()),
+                );
+                field.request_focus();
+                ui.add_space(SPACE_3);
+                ui.horizontal(|ui| {
+                    let add = egui::Button::new(RichText::new("Add").font(theme::label()).color(ON_ACCENT)).fill(ACCENT);
+                    if ui.add(add).clicked() {
+                        choice = 1;
+                    }
+                    if ui.add(egui::Button::new(RichText::new("Cancel").font(theme::label()))).clicked() {
+                        choice = 2;
+                    }
+                });
+            });
+            if modal.should_close() && choice == 0 {
+                choice = 2;
+            }
+            if choice != 0 {
+                let (_, _, text) = self.note_prompt.take().unwrap();
+                if choice == 1 && !text.trim().is_empty() {
+                    if let Some(d) = self.docs.get(self.active) {
+                        let edit = Edit::Note { page, at: [at.x, at.y], text: text.trim().to_string() };
+                        let _ = self.req.send(Req::Edit { id: d.id, edit });
+                    }
+                }
+            }
+        }
+
         let primary = |text: &str| {
             egui::Button::new(RichText::new(text).font(theme::label()).color(ON_ACCENT)).fill(ACCENT)
         };
@@ -2102,9 +2617,10 @@ impl App {
             6 if t.shots.load(Ordering::Relaxed) >= 4 && self.last_copied.is_some() => {
                 t.log += &format!("copied selection: {:?}\n", self.last_copied.as_deref().unwrap_or(""));
                 // Highlight a selection that spans the title and three lines, plus one on page 2.
-                let _ = self.req.send(Req::Highlight { id: d.id, from: (0, 0), to: (0, 260), color: [255, 216, 77] });
-                let _ = self.req.send(Req::Highlight { id: d.id, from: (1, 30), to: (1, 120), color: [255, 216, 77] });
-                let _ = self.req.send(Req::Unhighlight { id: d.id, page: 1, at: [200.0, 90.0] });
+                let yellow = [255, 216, 77];
+                let _ = self.req.send(Req::Edit { id: d.id, edit: Edit::Markup { kind: Markup::Highlight, from: (0, 0), to: (0, 260), color: yellow } });
+                let _ = self.req.send(Req::Edit { id: d.id, edit: Edit::Markup { kind: Markup::Highlight, from: (1, 30), to: (1, 120), color: yellow } });
+                let _ = self.req.send(Req::Edit { id: d.id, edit: Edit::RemoveAnnot { page: 1, at: [200.0, 90.0] } });
                 d.search_open = false;
                 d.hits.clear();
                 d.fit = Fit::Page;
@@ -2114,14 +2630,14 @@ impl App {
             }
             60 if d.dirty
                 && d.complete
-                && d.texts.get(&0).is_some_and(|x| !x.highlights.is_empty())
+                && d.texts.get(&0).is_some_and(|x| !x.marks.is_empty())
                 && d.texts.contains_key(&1) =>
             {
                 let ms = t.zoom_started.unwrap().elapsed().as_secs_f64() * 1000.0;
                 t.log += &format!(
                     "highlight two pages, remove one, redraw: {ms:.0} ms; page 1 has {} highlight(s), page 2 has {}\n",
-                    d.texts[&0].highlights.len(),
-                    d.texts[&1].highlights.len()
+                    d.texts[&0].marks.len(),
+                    d.texts[&1].marks.len()
                 );
                 shot("highlight.bmp", t);
                 t.phase = 61;
@@ -2140,9 +2656,88 @@ impl App {
             }
             63 if t.shots.load(Ordering::Relaxed) >= 6 => {
                 self.settings_open = false;
+                // Move page 1 to third place and read it back from there.
+                self.last_copied = None;
+                let _ = self.req.send(Req::Edit { id: d.id, edit: Edit::Move { pages: vec![0], before: 3 } });
+                let _ = self.req.send(Req::Copy { id: d.id, from: (2, 0), to: (2, 23) });
+                t.phase = 70;
+            }
+            70 if self.last_copied.is_some() && d.can_undo => {
+                t.log += &format!(
+                    "move page 1 before page 4: the third page now reads {:?}\n",
+                    self.last_copied.take().unwrap_or_default()
+                );
+                let _ = self.req.send(Req::Undo { id: d.id });
+                let _ = self.req.send(Req::Copy { id: d.id, from: (0, 0), to: (0, 23) });
+                t.phase = 71;
+            }
+            71 if self.last_copied.is_some() && d.can_redo => {
+                t.log += &format!("undo the move: the first page reads {:?}\n", self.last_copied.take().unwrap_or_default());
+                let id = d.id;
+                let zigzag: Vec<[f32; 2]> = (0..22).map(|k| [60.0 + k as f32 * 11.0, if k % 2 == 0 { 668.0 } else { 684.0 }]).collect();
+                for edit in [
+                    Edit::Markup { kind: Markup::Underline, from: (0, 340), to: (0, 420), color: [124, 58, 237] },
+                    Edit::Markup { kind: Markup::Strikeout, from: (0, 520), to: (0, 590), color: [229, 72, 77] },
+                    Edit::Note { page: 0, at: [470.0, 60.0], text: "Check this figure against the source.".into() },
+                    Edit::Ink { page: 0, points: zigzag, color: [124, 58, 237], width: 2.0 },
+                ] {
+                    let _ = self.req.send(Req::Edit { id, edit });
+                }
+                let extract = t.dir.join("extract.pdf");
+                let _ = self.req.send(Req::Extract { id, pages: vec![0, 1, 2], path: extract.clone() });
+                let job = crate::print::Job::File {
+                    printer: "Microsoft Print to PDF".into(),
+                    output: t.dir.join("printed.pdf"),
+                    pages: 2,
+                };
+                let _ = self.req.send(Req::Print { id, job });
+                let _ = self.req.send(Req::Edit { id, edit: Edit::Insert { path: extract, at: 1 } });
+                d.fit = Fit::Page;
+                d.go_to(0);
+                t.phase = 72;
+            }
+            72 if d.n() == 303 && d.complete && d.texts.get(&0).is_some_and(|x| !x.notes.is_empty()) => {
+                let x = &d.texts[&0];
+                t.log += &format!(
+                    "page 1 annotations: {} areas, {} note(s); links on page 1: {}; outline entries: {}; pages after inserting 3: {}\n",
+                    x.marks.len(),
+                    x.notes.len(),
+                    x.links.len(),
+                    d.outline.len(),
+                    d.n()
+                );
+                shot("annotations.bmp", t);
+                t.phase = 73;
+            }
+            73 if t.shots.load(Ordering::Relaxed) >= 7 => {
+                self.side_outline = true;
+                d.two_page = true;
+                d.relayout();
+                d.fit = Fit::Width;
+                d.go_to(0);
+                t.frames = 0;
+                t.phase = 74;
+            }
+            74 => {
+                t.frames += 1;
+                if t.frames > 6 && d.complete && d.fit_zoom(Fit::Width) == d.zoom {
+                    shot("two-page.bmp", t);
+                    t.phase = 75;
+                }
+            }
+            75 if t.shots.load(Ordering::Relaxed) >= 8 => {
+                self.side_outline = false;
+                d.two_page = false;
+                d.relayout();
+                d.fit = Fit::Page;
+                let _ = self.req.send(Req::Undo { id: d.id });
+                t.phase = 76;
+            }
+            76 if d.n() == 300 => {
+                t.log += &format!("undo the insert: back to {} pages\n", d.n());
                 // Edit round trip: rotate page 1, delete page 2, save a copy.
-                let _ = self.req.send(Req::Rotate { id: d.id, pages: vec![0], clockwise: true });
-                let _ = self.req.send(Req::Delete { id: d.id, pages: vec![1] });
+                let _ = self.req.send(Req::Edit { id: d.id, edit: Edit::Rotate { pages: vec![0], clockwise: true } });
+                let _ = self.req.send(Req::Edit { id: d.id, edit: Edit::Delete { pages: vec![1] } });
                 let _ = self.req.send(Req::Save { id: d.id, path: t.dir.join("edited.pdf") });
                 d.go_to(0);
                 t.zoom_started = Some(Instant::now());
@@ -2157,7 +2752,7 @@ impl App {
                 shot("edited.bmp", t);
                 t.phase = 8;
             }
-            8 if t.shots.load(Ordering::Relaxed) >= 7 => {
+            8 if t.shots.load(Ordering::Relaxed) >= 9 => {
                 if std::env::var_os("SHORUI_SELFTEST_UPDATE").is_some() {
                     // Exercise the update check against the real GitHub repo.
                     let describe = |u: Update| match u {
@@ -2208,6 +2803,19 @@ fn write_bmp(path: &Path, img: &egui::ColorImage) -> std::io::Result<()> {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.selftest.is_some() {
+            return;
+        }
+        // Remember the open tabs for next time.
+        self.settings.session = if self.settings.restore_session {
+            self.docs.iter().filter(|d| d.error.is_none() && !d.loading).map(|d| (d.path.clone(), d.current, d.zoom)).collect()
+        } else {
+            Vec::new()
+        };
+        self.settings.save();
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let started = Instant::now();
         let ctx = ui.ctx().clone();

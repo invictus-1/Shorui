@@ -1,6 +1,6 @@
 [package]
 name = "shorui"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A fast PDF reader and editor"
 
@@ -8,8 +8,9 @@ description = "A fast PDF reader and editor"
 crossbeam-channel = "0.5.17"
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
 egui = "0.37.0"
-pdfium-render = { version = "0.9.5", default-features = false, features = ["pdfium_latest"] }
+pdfium-render = { version = "0.9.5", default-features = false, features = ["pdfium_latest", "pdfium_use_win32"] }
 rfd = "0.18.0"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_UI_Controls_Dialogs"] }
 
 [profile.dev]
 opt-level = 1

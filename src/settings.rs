@@ -36,15 +36,32 @@ pub struct Settings {
     pub highlight: usize,
     /// Unix time of the last automatic update check.
     pub last_check: u64,
+    pub restore_session: bool,
+    pub two_page: bool,
+    /// Most recently opened files, newest first.
+    pub recent: Vec<PathBuf>,
+    /// The tabs open when Shorui last closed: file, page and zoom.
+    pub session: Vec<(PathBuf, u32, f32)>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { open_zoom: OpenZoom::FitWidth, sidebar: true, auto_update: true, highlight: 0, last_check: 0 }
+        Self { open_zoom: OpenZoom::FitWidth, sidebar: true, auto_update: true,
+            highlight: 0,
+            last_check: 0,
+            restore_session: true,
+            two_page: false,
+            recent: Vec::new(),
+            session: Vec::new(),
+        }
     }
 }
 
 fn path() -> Option<PathBuf> {
+    // SHORUI_CONFIG_DIR keeps settings somewhere else: a portable copy, or a test run.
+    if let Some(dir) = std::env::var_os("SHORUI_CONFIG_DIR") {
+        return Some(PathBuf::from(dir).join("settings.txt"));
+    }
     Some(PathBuf::from(std::env::var_os("APPDATA")?).join("Shorui").join("settings.txt"))
 }
 
@@ -66,6 +83,18 @@ impl Settings {
                 ("auto_update", v) => s.auto_update = v == "true",
                 ("highlight", v) => s.highlight = v.parse().unwrap_or(0).min(HIGHLIGHTS.len() - 1),
                 ("last_check", v) => s.last_check = v.parse().unwrap_or(0),
+                ("restore_session", v) => s.restore_session = v == "true",
+                ("two_page", v) => s.two_page = v == "true",
+                ("recent", v) if !v.is_empty() => s.recent.push(PathBuf::from(v)),
+                ("session", v) => {
+                    // file|page|zoom. '|' can't appear in a Windows path.
+                    let mut parts = v.rsplitn(3, '|');
+                    let zoom = parts.next().and_then(|z| z.parse().ok()).unwrap_or(1.0);
+                    let page = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+                    if let Some(path) = parts.next().filter(|p| !p.is_empty()) {
+                        s.session.push((PathBuf::from(path), page, zoom));
+                    }
+                }
                 _ => {}
             }
         }
@@ -86,7 +115,22 @@ impl Settings {
             "open_zoom={zoom}\nsidebar={}\nauto_update={}\nhighlight={}\nlast_check={}\n",
             self.sidebar, self.auto_update, self.highlight, self.last_check
         );
+        let mut text = text;
+        text += &format!("restore_session={}\ntwo_page={}\n", self.restore_session, self.two_page);
+        for r in &self.recent {
+            text += &format!("recent={}\n", r.display());
+        }
+        for (path, page, zoom) in &self.session {
+            text += &format!("session={}|{page}|{zoom}\n", path.display());
+        }
         let _ = std::fs::write(p, text);
+    }
+
+    /// Puts a file at the top of the recent list.
+    pub fn remember(&mut self, path: &std::path::Path) {
+        self.recent.retain(|r| r != path);
+        self.recent.insert(0, path.to_path_buf());
+        self.recent.truncate(10);
     }
 
     pub fn highlight_rgb(&self) -> [u8; 3] {

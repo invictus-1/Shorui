@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod print;
 mod render;
 mod settings;
 mod theme;
@@ -9,7 +10,14 @@ use std::{path::PathBuf, time::Instant};
 
 fn main() -> eframe::Result {
     let t0 = Instant::now();
-    let files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    let mut files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    if files.is_empty() && std::env::var_os("SHORUI_SELFTEST").is_none() {
+        // Nothing asked for: bring back the tabs from last time.
+        let saved = settings::Settings::load();
+        if saved.restore_session {
+            files = saved.session.into_iter().map(|s| s.0).filter(|p| p.exists()).collect();
+        }
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Shorui")

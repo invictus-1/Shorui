@@ -3,6 +3,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    os::raw::c_int,
     path::PathBuf,
     sync::{
         Arc,
@@ -18,6 +19,18 @@ use pdfium_render::prelude::*;
 pub const TILE: u32 = 1024;
 /// How many parsed pages stay loaded for fast re-rendering.
 const PAGE_CACHE: usize = 24;
+/// Undo history: how many steps, and how much memory whole-document snapshots may hold.
+const UNDO_STEPS: usize = 40;
+const UNDO_BYTES: usize = 512 << 20;
+
+// Annotation subtypes, from the PDF specification as PDFium numbers them.
+const ANNOT_TEXT: c_int = 1;
+const ANNOT_HIGHLIGHT: c_int = 9;
+const ANNOT_UNDERLINE: c_int = 10;
+const ANNOT_SQUIGGLY: c_int = 11;
+const ANNOT_STRIKEOUT: c_int = 12;
+const ANNOT_INK: c_int = 15;
+const ANNOT_FLAG_PRINT: c_int = 4;
 
 pub type DocId = u64;
 
@@ -29,24 +42,61 @@ pub struct Gens {
     pub search: AtomicU64,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Markup {
+    Highlight,
+    Underline,
+    Strikeout,
+}
+
+/// A change to a document. Positions are (page, character index); points are in top-left page
+/// points, the same space as [`PageText::boxes`].
+pub enum Edit {
+    Rotate { pages: Vec<u32>, clockwise: bool },
+    Delete { pages: Vec<u32> },
+    /// Moves pages so they sit, in order, just before the page currently at `before`.
+    Move { pages: Vec<u32>, before: u32 },
+    /// Inserts every page of another PDF before the page currently at `at`.
+    Insert { path: PathBuf, at: u32 },
+    Markup { kind: Markup, from: (u32, u32), to: (u32, u32), color: [u8; 3] },
+    Note { page: u32, at: [f32; 2], text: String },
+    Ink { page: u32, points: Vec<[f32; 2]>, color: [u8; 3], width: f32 },
+    /// Removes the topmost annotation under a point.
+    RemoveAnnot { page: u32, at: [f32; 2] },
+}
+
 pub enum Req {
     Open { id: DocId, path: PathBuf, password: Option<String> },
     Close { id: DocId },
     Tile { id: DocId, page: u32, scale: f32, tx: u32, ty: u32, stamp: u64 },
     Thumb { id: DocId, page: u32, width: u32, stamp: u64 },
-    Rotate { id: DocId, pages: Vec<u32>, clockwise: bool },
-    Delete { id: DocId, pages: Vec<u32> },
     Save { id: DocId, path: PathBuf },
-    /// Text and character boxes of one page, for selection.
+    /// Text, links and annotation areas of one page.
     Text { id: DocId, page: u32 },
     /// Case-insensitive search of the whole document. A newer search stamp cancels this one.
     Search { id: DocId, query: String, stamp: u64 },
     /// The text between two (page, character) positions, inclusive.
     Copy { id: DocId, from: (u32, u32), to: (u32, u32) },
-    /// Adds a highlight annotation over the text between two positions, inclusive.
-    Highlight { id: DocId, from: (u32, u32), to: (u32, u32), color: [u8; 3] },
-    /// Removes the topmost highlight under a point given in top-left page points.
-    Unhighlight { id: DocId, page: u32, at: [f32; 2] },
+    Edit { id: DocId, edit: Edit },
+    Undo { id: DocId },
+    Redo { id: DocId },
+    /// Writes the given pages to a new PDF.
+    Extract { id: DocId, pages: Vec<u32>, path: PathBuf },
+    Print { id: DocId, job: crate::print::Job },
+}
+
+#[derive(Clone, PartialEq)]
+pub enum Link {
+    Page(u32),
+    Uri(String),
+}
+
+/// One outline (bookmark) entry: nesting depth, title and target page.
+#[derive(Clone)]
+pub struct OutlineItem {
+    pub depth: u8,
+    pub title: String,
+    pub page: Option<u32>,
 }
 
 /// The characters of a page in reading order, each with its box in points from the page's
@@ -54,8 +104,11 @@ pub enum Req {
 pub struct PageText {
     pub chars: Vec<char>,
     pub boxes: Vec<[f32; 4]>,
-    /// Bounds of the highlight annotations already on the page, in the same space as `boxes`.
-    pub highlights: Vec<[f32; 4]>,
+    /// Areas covered by annotations Shorui can remove, in the same space as `boxes`.
+    pub marks: Vec<[f32; 4]>,
+    /// Sticky notes: where they are and what they say.
+    pub notes: Vec<([f32; 4], String)>,
+    pub links: Vec<([f32; 4], Link)>,
     /// PDF page space to top-left points: origin, then the images of the x and y unit vectors.
     m: [f32; 6],
 }
@@ -66,23 +119,24 @@ impl PageText {
         (m[0] + m[2] * x + m[4] * y, m[1] + m[3] * x + m[5] * y)
     }
 
-    /// A PDF-space rectangle as [x0, y0, x1, y1] in top-left points.
-    fn rect_to_view(&self, r: &PdfRect) -> [f32; 4] {
-        let (x0, y0) = self.to_view(r.left().value, r.bottom().value);
-        let (x1, y1) = self.to_view(r.right().value, r.top().value);
+    fn to_page(&self, vx: f32, vy: f32) -> (f32, f32) {
+        let m = &self.m;
+        let det = m[2] * m[5] - m[4] * m[3];
+        let (dx, dy) = (vx - m[0], vy - m[1]);
+        ((dx * m[5] - m[4] * dy) / det, (m[2] * dy - m[3] * dx) / det)
+    }
+
+    /// A PDF-space rectangle [left, bottom, right, top] as [x0, y0, x1, y1] in top-left points.
+    fn rect_to_view(&self, r: [f32; 4]) -> [f32; 4] {
+        let (x0, y0) = self.to_view(r[0], r[1]);
+        let (x1, y1) = self.to_view(r[2], r[3]);
         [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)]
     }
 
     /// A top-left-points rectangle as [left, bottom, right, top] in PDF page space.
     fn rect_to_page(&self, r: &[f32; 4]) -> [f32; 4] {
-        let m = &self.m;
-        let det = m[2] * m[5] - m[4] * m[3];
-        let inv = |vx: f32, vy: f32| {
-            let (dx, dy) = (vx - m[0], vy - m[1]);
-            ((dx * m[5] - m[4] * dy) / det, (m[2] * dy - m[3] * dx) / det)
-        };
-        let (x0, y0) = inv(r[0], r[1]);
-        let (x1, y1) = inv(r[2], r[3]);
+        let (x0, y0) = self.to_page(r[0], r[1]);
+        let (x1, y1) = self.to_page(r[2], r[3]);
         [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)]
     }
 }
@@ -122,11 +176,22 @@ pub fn line_rects(boxes: &[[f32; 4]]) -> Vec<[f32; 4]> {
 
 pub enum Resp {
     Fatal(String),
-    Opened { id: DocId, sizes: Vec<[f32; 2]> },
+    Opened { id: DocId, sizes: Vec<[f32; 2]>, outline: Vec<OutlineItem> },
     OpenFailed { id: DocId, error: String, needs_password: bool },
     Tile { id: DocId, epoch: u64, page: u32, scale: f32, tx: u32, ty: u32, tex: TextureHandle, bytes: usize },
     Thumb { id: DocId, epoch: u64, page: u32, tex: TextureHandle },
-    Edited { id: DocId, epoch: u64, sizes: Vec<[f32; 2]> },
+    /// The document changed. `pages` set: only those pages need redrawing (annotations).
+    /// Otherwise the page list itself changed and everything is laid out again.
+    Edited {
+        id: DocId,
+        epoch: u64,
+        sizes: Vec<[f32; 2]>,
+        outline: Vec<OutlineItem>,
+        pages: Option<Vec<u32>>,
+        note: &'static str,
+        can_undo: bool,
+        can_redo: bool,
+    },
     EditFailed { error: String },
     Saved { id: DocId, path: PathBuf },
     SaveFailed { id: DocId, error: String },
@@ -134,8 +199,8 @@ pub enum Resp {
     Hits { id: DocId, stamp: u64, page: u32, hits: Vec<Vec<[f32; 4]>> },
     SearchDone { id: DocId, stamp: u64 },
     Copied(String),
-    /// Annotations on these pages changed. Only they need redrawing.
-    Annotated { id: DocId, epoch: u64, pages: Vec<u32>, added: bool },
+    /// A one-line result to show the user: extract and print outcomes.
+    Notice { text: String, error: bool },
 }
 
 pub fn spawn(ctx: egui::Context, gens: Arc<Gens>) -> (Sender<Req>, Receiver<Resp>) {
@@ -148,9 +213,52 @@ pub fn spawn(ctx: egui::Context, gens: Arc<Gens>) -> (Sender<Req>, Receiver<Resp
     (req_tx, resp_rx)
 }
 
+/// An annotation to create, in PDF page space.
+#[derive(Clone)]
+enum AnnotSpec {
+    Markup { page: u32, kind: Markup, rects: Vec<[f32; 4]>, color: [u8; 3] },
+    Note { page: u32, at: [f32; 2], text: String },
+    Ink { page: u32, points: Vec<[f32; 2]>, color: [u8; 3], width: f32 },
+}
+
+impl AnnotSpec {
+    fn page(&self) -> u32 {
+        match self {
+            AnnotSpec::Markup { page, .. } | AnnotSpec::Note { page, .. } | AnnotSpec::Ink { page, .. } => *page,
+        }
+    }
+}
+
+/// One reversible step. Running a step returns the step that undoes it.
+enum Step {
+    Rotate { pages: Vec<u32>, clockwise: bool },
+    /// Single-page moves applied in order: the page at index `.0` ends up at index `.1`.
+    Moves(Vec<(u32, u32)>),
+    AddAnnots(Vec<AnnotSpec>),
+    /// Removes the newest annotation on each spec's page, last spec first.
+    PopAnnots(Vec<AnnotSpec>),
+    /// Replaces the whole document with these bytes. Used for edits with no cheap inverse.
+    Restore(Vec<u8>),
+}
+
+impl Step {
+    fn bytes(&self) -> usize {
+        if let Step::Restore(b) = self { b.len() } else { 0 }
+    }
+}
+
+/// What a step touched: every page, or just the annotations of some.
+enum Changed {
+    All,
+    Pages(Vec<u32>),
+}
+
 struct Doc {
     doc: PdfDocument<'static>,
     epoch: u64,
+    password: Option<String>,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
 }
 
 struct Worker {
@@ -168,6 +276,13 @@ struct TileJob {
     scale: f32,
     tx: u32,
     ty: u32,
+    stamp: u64,
+}
+
+struct ThumbJob {
+    id: DocId,
+    page: u32,
+    width: u32,
     stamp: u64,
 }
 
@@ -214,23 +329,124 @@ fn find(text: &PageText, query: &[char]) -> Vec<Vec<[f32; 4]>> {
     hits
 }
 
-/// The area a highlight covers, one rectangle per line, in top-left page points.
-fn highlight_rects(a: &mut PdfPageAnnotation, text: &PageText) -> Vec<[f32; 4]> {
+/// An existing annotation Shorui knows how to remove: where it is, and its note text if any.
+struct AnnotInfo {
+    index: c_int,
+    /// Areas in PDF page space, [left, bottom, right, top].
+    rects: Vec<[f32; 4]>,
+    note: Option<String>,
+}
+
+/// Lists the markup, note and ink annotations on a page.
+fn annots(page: &PdfPage<'static>) -> Vec<AnnotInfo> {
+    let b = page.bindings();
+    let handle = b.get_handle_from_page(page);
     let mut out = Vec::new();
-    if let Some(h) = a.as_highlight_annotation_mut() {
-        for quad in h.attachment_points_mut().iter() {
-            out.push(text.rect_to_view(&quad.to_rect()));
-        }
-    }
-    if out.is_empty() {
-        if let Ok(b) = a.bounds() {
-            out.push(text.rect_to_view(&b));
+    unsafe {
+        for index in 0..b.FPDFPage_GetAnnotCount(handle) {
+            let a = b.FPDFPage_GetAnnot(handle, index);
+            if a.is_null() {
+                continue;
+            }
+            let subtype = b.FPDFAnnot_GetSubtype(a);
+            let markup = matches!(subtype, ANNOT_HIGHLIGHT | ANNOT_UNDERLINE | ANNOT_SQUIGGLY | ANNOT_STRIKEOUT);
+            if markup || subtype == ANNOT_TEXT || subtype == ANNOT_INK {
+                let mut rects = Vec::new();
+                if markup {
+                    for q in 0..b.FPDFAnnot_CountAttachmentPoints(a) {
+                        let mut quad = FS_QUADPOINTSF { x1: 0.0, y1: 0.0, x2: 0.0, y2: 0.0, x3: 0.0, y3: 0.0, x4: 0.0, y4: 0.0 };
+                        if b.is_true(b.FPDFAnnot_GetAttachmentPoints(a, q, &mut quad)) {
+                            let xs = [quad.x1, quad.x2, quad.x3, quad.x4];
+                            let ys = [quad.y1, quad.y2, quad.y3, quad.y4];
+                            let min = |v: [f32; 4]| v.into_iter().fold(f32::MAX, f32::min);
+                            let max = |v: [f32; 4]| v.into_iter().fold(f32::MIN, f32::max);
+                            rects.push([min(xs), min(ys), max(xs), max(ys)]);
+                        }
+                    }
+                }
+                if rects.is_empty() {
+                    let mut r = FS_RECTF { left: 0.0, top: 0.0, right: 0.0, bottom: 0.0 };
+                    if b.is_true(b.FPDFAnnot_GetRect(a, &mut r)) {
+                        rects.push([r.left.min(r.right), r.top.min(r.bottom), r.left.max(r.right), r.top.max(r.bottom)]);
+                    }
+                }
+                let note = (subtype == ANNOT_TEXT).then(|| {
+                    let len = b.FPDFAnnot_GetStringValue(a, "Contents", std::ptr::null_mut(), 0) as usize;
+                    let mut buf = vec![0u16; len / 2 + 1];
+                    b.FPDFAnnot_GetStringValue(a, "Contents", buf.as_mut_ptr(), (buf.len() * 2) as _);
+                    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                    String::from_utf16_lossy(&buf[..end])
+                });
+                out.push(AnnotInfo { index, rects, note });
+            }
+            b.FPDFPage_CloseAnnot(a);
         }
     }
     out
 }
 
-/// Reads a page's characters and maps their boxes into top-left page points.
+/// Creates one annotation. PDFium draws its appearance from the colour, quads and ink list.
+fn create_annot(page: &PdfPage<'static>, spec: &AnnotSpec) -> Result<(), PdfiumError> {
+    let b = page.bindings();
+    let handle = b.get_handle_from_page(page);
+    let fail = || PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::Unknown);
+    let color_type = 0; // FPDFANNOT_COLORTYPE_Color: the annotation's own colour
+    unsafe {
+        let (subtype, bounds, color) = match spec {
+            AnnotSpec::Markup { kind, rects, color, .. } => {
+                let mut u = *rects.first().ok_or_else(fail)?;
+                for r in rects {
+                    u = [u[0].min(r[0]), u[1].min(r[1]), u[2].max(r[2]), u[3].max(r[3])];
+                }
+                let subtype = match kind {
+                    Markup::Highlight => ANNOT_HIGHLIGHT,
+                    Markup::Underline => ANNOT_UNDERLINE,
+                    Markup::Strikeout => ANNOT_STRIKEOUT,
+                };
+                (subtype, u, *color)
+            }
+            AnnotSpec::Note { at, .. } => (ANNOT_TEXT, [at[0], at[1] - 20.0, at[0] + 20.0, at[1]], [255, 216, 77]),
+            AnnotSpec::Ink { points, color, width, .. } => {
+                let first = *points.first().ok_or_else(fail)?;
+                let mut u = [first[0], first[1], first[0], first[1]];
+                for p in points {
+                    u = [u[0].min(p[0]), u[1].min(p[1]), u[2].max(p[0]), u[3].max(p[1])];
+                }
+                (ANNOT_INK, [u[0] - width, u[1] - width, u[2] + width, u[3] + width], *color)
+            }
+        };
+        let a = b.FPDFPage_CreateAnnot(handle, subtype);
+        if a.is_null() {
+            return Err(fail());
+        }
+        let rect = FS_RECTF { left: bounds[0], bottom: bounds[1], right: bounds[2], top: bounds[3] };
+        b.FPDFAnnot_SetRect(a, &rect);
+        b.FPDFAnnot_SetColor(a, color_type, color[0] as _, color[1] as _, color[2] as _, 255);
+        b.FPDFAnnot_SetFlags(a, ANNOT_FLAG_PRINT);
+        match spec {
+            AnnotSpec::Markup { rects, .. } => {
+                for r in rects {
+                    // PDF order: top-left, top-right, bottom-left, bottom-right.
+                    let quad =
+                        FS_QUADPOINTSF { x1: r[0], y1: r[3], x2: r[2], y2: r[3], x3: r[0], y3: r[1], x4: r[2], y4: r[1] };
+                    b.FPDFAnnot_AppendAttachmentPoints(a, &quad);
+                }
+            }
+            AnnotSpec::Note { text, .. } => {
+                b.FPDFAnnot_SetStringValue_str(a, "Contents", text);
+            }
+            AnnotSpec::Ink { points, width, .. } => {
+                let pts: Vec<FS_POINTF> = points.iter().map(|p| FS_POINTF { x: p[0], y: p[1] }).collect();
+                b.FPDFAnnot_AddInkStroke(a, pts.as_ptr(), pts.len() as _);
+                b.FPDFAnnot_SetBorder(a, 0.0, 0.0, *width);
+            }
+        }
+        b.FPDFPage_CloseAnnot(a);
+    }
+    Ok(())
+}
+
+/// Reads a page's characters, links and annotations, mapped into top-left page points.
 fn extract(page: &PdfPage<'static>) -> Option<PageText> {
     // Recover the page-to-view transform (rotation, crop offset) from three probe points.
     const S: f32 = 8.0;
@@ -245,32 +461,94 @@ fn extract(page: &PdfPage<'static>) -> Option<PageText> {
     if ax * by - bx * ay == 0.0 {
         return None;
     }
+    let mut out = PageText {
+        chars: Vec::new(),
+        boxes: Vec::new(),
+        marks: Vec::new(),
+        notes: Vec::new(),
+        links: Vec::new(),
+        m: [o.0, o.1, ax, ay, bx, by],
+    };
+    let rect = |r: &PdfRect| [r.left().value, r.bottom().value, r.right().value, r.top().value];
 
-    let text = page.text().ok()?;
-    let chars = text.chars();
-    let mut out =
-        PageText { chars: Vec::new(), boxes: Vec::new(), highlights: Vec::new(), m: [o.0, o.1, ax, ay, bx, by] };
-    for mut a in page.annotations().iter() {
-        if a.annotation_type() == PdfPageAnnotationType::Highlight {
-            let rects = highlight_rects(&mut a, &out);
-            out.highlights.extend(rects);
+    for a in annots(page) {
+        for r in &a.rects {
+            let v = out.rect_to_view(*r);
+            if let Some(text) = &a.note {
+                out.notes.push((v, text.clone()));
+            }
+            out.marks.push(v);
         }
     }
-    for c in chars.iter() {
-        out.chars.push(c.unicode_char().unwrap_or('\u{fffd}'));
-        out.boxes.push(match c.loose_bounds() {
-            Ok(r) => out.rect_to_view(&r),
-            Err(_) => [0.0; 4],
-        });
+    for link in page.links().iter() {
+        let Ok(r) = link.rect() else { continue };
+        let action = link.action();
+        let uri = action.as_ref().and_then(|a| a.as_uri_action()).and_then(|u| u.uri().ok());
+        let target = match uri {
+            Some(u) => Some(Link::Uri(u)),
+            None => action
+                .as_ref()
+                .and_then(|a| a.as_local_destination_action())
+                .and_then(|d| d.destination().ok())
+                .and_then(|d| d.page_index().ok())
+                .or_else(|| link.destination().and_then(|d| d.page_index().ok()))
+                .map(|p| Link::Page(p as u32)),
+        };
+        if let Some(target) = target {
+            out.links.push((out.rect_to_view(rect(&r)), target));
+        }
+    }
+    if let Ok(text) = page.text() {
+        for c in text.chars().iter() {
+            out.chars.push(c.unicode_char().unwrap_or('\u{fffd}'));
+            out.boxes.push(match c.loose_bounds() {
+                Ok(r) => out.rect_to_view(rect(&r)),
+                Err(_) => [0.0; 4],
+            });
+        }
     }
     Some(out)
 }
 
-struct ThumbJob {
-    id: DocId,
-    page: u32,
-    width: u32,
-    stamp: u64,
+fn sizes_of(doc: &PdfDocument<'static>) -> Vec<[f32; 2]> {
+    let pages = doc.pages();
+    (0..pages.len())
+        .map(|i| match pages.page_size(i) {
+            Ok(r) => [r.width().value.max(1.0), r.height().value.max(1.0)],
+            Err(_) => [612.0, 792.0],
+        })
+        .collect()
+}
+
+/// Flattens the document's bookmark tree, depth first.
+fn outline_of(doc: &PdfDocument<'static>) -> Vec<OutlineItem> {
+    fn walk(first: Option<PdfBookmark>, depth: u8, out: &mut Vec<OutlineItem>) {
+        let mut node = first;
+        while let Some(b) = node {
+            if out.len() >= 5000 {
+                return;
+            }
+            let page = b
+                .destination()
+                .and_then(|d| d.page_index().ok())
+                .or_else(|| {
+                    b.action()
+                        .as_ref()
+                        .and_then(|a| a.as_local_destination_action())
+                        .and_then(|d| d.destination().ok())
+                        .and_then(|d| d.page_index().ok())
+                })
+                .map(|p| p as u32);
+            out.push(OutlineItem { depth, title: b.title().unwrap_or_default(), page });
+            if depth < 8 {
+                walk(b.first_child(), depth + 1, out);
+            }
+            node = b.next_sibling();
+        }
+    }
+    let mut out = Vec::new();
+    walk(doc.bookmarks().root(), 0, &mut out);
+    out
 }
 
 fn run(ctx: egui::Context, gens: Arc<Gens>, rx: Receiver<Req>, out: Sender<Resp>) {
@@ -355,15 +633,7 @@ fn run(ctx: egui::Context, gens: Arc<Gens>, rx: Receiver<Req>, out: Sender<Resp>
     }
 }
 
-fn sizes_of(doc: &PdfDocument<'static>) -> Vec<[f32; 2]> {
-    let pages = doc.pages();
-    (0..pages.len())
-        .map(|i| match pages.page_size(i) {
-            Ok(r) => [r.width().value.max(1.0), r.height().value.max(1.0)],
-            Err(_) => [612.0, 792.0],
-        })
-        .collect()
-}
+type Outcome = Result<(Step, Changed), PdfiumError>;
 
 impl Worker {
     fn send(&self, r: Resp) {
@@ -407,9 +677,9 @@ impl Worker {
             Req::Open { id, path, password } => {
                 match self.pdfium.load_pdf_from_file(&path, password.as_deref()) {
                     Ok(doc) => {
-                        let sizes = sizes_of(&doc);
-                        self.docs.insert(id, Doc { doc, epoch: 0 });
-                        self.send(Resp::Opened { id, sizes });
+                        let (sizes, outline) = (sizes_of(&doc), outline_of(&doc));
+                        self.docs.insert(id, Doc { doc, epoch: 0, password, undo: Vec::new(), redo: Vec::new() });
+                        self.send(Resp::Opened { id, sizes, outline });
                     }
                     Err(e) => {
                         let needs_password = matches!(
@@ -430,38 +700,6 @@ impl Worker {
             Req::Close { id } => {
                 self.drop_pages(id);
                 self.docs.remove(&id);
-            }
-            Req::Rotate { id, pages, clockwise } => {
-                self.drop_pages(id);
-                let result = (|| -> Result<(), PdfiumError> {
-                    let Some(d) = self.docs.get(&id) else { return Ok(()) };
-                    for &i in &pages {
-                        let mut p = d.doc.pages().get(i as PdfPageIndex)?;
-                        use PdfPageRenderRotation::*;
-                        let next = match (p.rotation()?, clockwise) {
-                            (None, true) | (Degrees180, false) => Degrees90,
-                            (Degrees90, true) | (Degrees270, false) => Degrees180,
-                            (Degrees180, true) | (None, false) => Degrees270,
-                            (Degrees270, true) | (Degrees90, false) => None,
-                        };
-                        p.set_rotation(next);
-                    }
-                    Ok(())
-                })();
-                self.edited(id, result);
-            }
-            Req::Delete { id, mut pages } => {
-                self.drop_pages(id);
-                pages.sort_unstable_by(|a, b| b.cmp(a));
-                pages.dedup();
-                let result = (|| -> Result<(), PdfiumError> {
-                    let Some(d) = self.docs.get(&id) else { return Ok(()) };
-                    for &i in &pages {
-                        d.doc.pages().get(i as PdfPageIndex)?.delete()?;
-                    }
-                    Ok(())
-                })();
-                self.edited(id, result);
             }
             Req::Save { id, path } => {
                 let Some(d) = self.docs.get(&id) else { return };
@@ -498,10 +736,89 @@ impl Worker {
                 }
                 self.send(Resp::Copied(out));
             }
-            Req::Highlight { id, from, to, color } => {
-                // Work out the line rectangles first, while the page text is still cached.
-                let mut plan: Vec<(u32, Vec<[f32; 4]>)> = Vec::new();
-                for page in from.0..=to.0 {
+            Req::Edit { id, edit } => self.edit(id, edit),
+            Req::Undo { id } => self.history(id, true),
+            Req::Redo { id } => self.history(id, false),
+            Req::Extract { id, mut pages, path } => {
+                pages.sort_unstable();
+                pages.dedup();
+                let result = (|| -> Result<(), PdfiumError> {
+                    let Some(d) = self.docs.get(&id) else { return Ok(()) };
+                    let mut new = self.pdfium.create_new_pdf()?;
+                    let list = pages.iter().map(|p| (p + 1).to_string()).collect::<Vec<_>>().join(",");
+                    new.pages_mut().copy_pages_from_document(&d.doc, &list, 0)?;
+                    new.save_to_file(&path)
+                })();
+                let count = pages.len();
+                self.send(match result {
+                    Ok(()) => Resp::Notice {
+                        text: if count == 1 { "Extracted 1 page.".into() } else { format!("Extracted {count} pages.") },
+                        error: false,
+                    },
+                    Err(e) => Resp::Notice { text: format!("Can't extract. {e:?}"), error: true },
+                });
+            }
+            Req::Print { id, job } => {
+                let pages = self.docs.get(&id).map(|d| d.doc.pages().len() as u32).unwrap_or(0);
+                let result = crate::print::run(job, pages, |index, dc, w, h| {
+                    let Some(page) = self.page(id, index) else { return false };
+                    // Fit the page inside the printable area, centred.
+                    let (pw, ph) = (page.width().value.max(1.0), page.height().value.max(1.0));
+                    let scale = (w as f32 / pw).min(h as f32 / ph);
+                    let (sx, sy) = ((pw * scale) as c_int, (ph * scale) as c_int);
+                    let b = page.bindings();
+                    // 0x01 draws annotations, 0x800 tells PDFium the target is a printer.
+                    unsafe {
+                        b.FPDF_RenderPage(dc, b.get_handle_from_page(page), (w - sx) / 2, (h - sy) / 2, sx, sy, 0, 0x801)
+                    };
+                    true
+                });
+                self.send(match result {
+                    Ok(1) => Resp::Notice { text: "Sent 1 page to the printer.".into(), error: false },
+                    Ok(count) => Resp::Notice { text: format!("Sent {count} pages to the printer."), error: false },
+                    Err(e) => Resp::Notice { text: format!("Can't print. {e}"), error: true },
+                });
+            }
+            Req::Tile { .. } | Req::Thumb { .. } | Req::Text { .. } | Req::Search { .. } => {}
+        }
+    }
+
+    /// The whole document as bytes, for an undo point.
+    fn snapshot(&self, id: DocId) -> Result<Vec<u8>, PdfiumError> {
+        self.docs.get(&id).ok_or(PdfiumError::PageIndexOutOfBounds)?.doc.save_to_bytes()
+    }
+
+    /// Applies a user edit and records how to undo it.
+    fn edit(&mut self, id: DocId, edit: Edit) {
+        let pages_len = self.docs.get(&id).map(|d| d.doc.pages().len() as u32).unwrap_or(0);
+        let (note, outcome): (&'static str, Outcome) = match edit {
+            Edit::Rotate { pages, clockwise } => ("", self.run_step(id, Step::Rotate { pages, clockwise })),
+            Edit::Move { mut pages, before } => {
+                pages.sort_unstable();
+                pages.dedup();
+                pages.retain(|p| *p < pages_len);
+                // Work out one move per page by simulating the list.
+                let mut order: Vec<u32> = (0..pages_len).collect();
+                let start = before.min(pages_len) - pages.iter().filter(|p| **p < before).count() as u32;
+                let mut moves = Vec::new();
+                for (t, page) in pages.iter().enumerate() {
+                    let target = start as usize + t;
+                    let Some(from) = order.iter().position(|p| p == page) else { continue };
+                    if from != target && target < order.len() {
+                        let p = order.remove(from);
+                        order.insert(target, p);
+                        moves.push((from as u32, target as u32));
+                    }
+                }
+                if moves.is_empty() {
+                    return;
+                }
+                ("Moved.", self.run_step(id, Step::Moves(moves)))
+            }
+            Edit::Markup { kind, from, to, color } => {
+                // Line rectangles come from the cached page text, converted to page space.
+                let mut specs = Vec::new();
+                for page in from.0..=to.0.min(pages_len.saturating_sub(1)) {
                     let Some(text) = self.text(id, page) else { continue };
                     if text.boxes.is_empty() {
                         continue;
@@ -514,86 +831,215 @@ impl Worker {
                     let rects: Vec<[f32; 4]> =
                         line_rects(&text.boxes[a..=b]).iter().map(|r| text.rect_to_page(r)).collect();
                     if !rects.is_empty() {
-                        plan.push((page, rects));
+                        specs.push(AnnotSpec::Markup { page, kind, rects, color });
                     }
                 }
-                if plan.is_empty() {
+                if specs.is_empty() {
                     return;
                 }
-                self.drop_pages(id);
-                let result = (|| -> Result<(), PdfiumError> {
-                    let Some(d) = self.docs.get(&id) else { return Ok(()) };
-                    for (page, rects) in &plan {
-                        let mut p = d.doc.pages().get(*page as PdfPageIndex)?;
-                        // Annotations live outside the page content, so leave the content alone.
-                        p.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
-                        let mut a = p.annotations_mut().create_highlight_annotation()?;
-                        let mut u = rects[0];
-                        for r in rects {
-                            u = [u[0].min(r[0]), u[1].min(r[1]), u[2].max(r[2]), u[3].max(r[3])];
-                        }
-                        a.set_bounds(PdfRect::new_from_values(u[1], u[0], u[3], u[2]))?;
-                        a.set_stroke_color(PdfColor::new(color[0], color[1], color[2], 255))?;
-                        for r in rects {
-                            // PDF order: top-left, top-right, bottom-left, bottom-right.
-                            let quad = PdfQuadPoints::new_from_values(r[0], r[3], r[2], r[3], r[0], r[1], r[2], r[1]);
-                            a.attachment_points_mut().create_attachment_point_at_end(quad)?;
-                        }
-                    }
-                    Ok(())
-                })();
-                self.annotated(id, plan.into_iter().map(|p| p.0).collect(), true, result);
+                let note = match kind {
+                    Markup::Highlight => "Highlighted.",
+                    Markup::Underline => "Underlined.",
+                    Markup::Strikeout => "Struck out.",
+                };
+                (note, self.run_step(id, Step::AddAnnots(specs)))
             }
-            Req::Unhighlight { id, page, at } => {
-                let Some(text) = self.text(id, page) else { return };
-                self.drop_pages(id);
-                let mut removed = false;
-                let result = (|| -> Result<(), PdfiumError> {
-                    let Some(d) = self.docs.get(&id) else { return Ok(()) };
-                    let mut p = d.doc.pages().get(page as PdfPageIndex)?;
-                    p.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
-                    let annots = p.annotations_mut();
-                    for i in annots.as_range().rev() {
-                        let mut a = annots.get(i)?;
-                        if a.annotation_type() != PdfPageAnnotationType::Highlight {
-                            continue;
-                        }
-                        let rects = highlight_rects(&mut a, &text);
-                        if rects.iter().any(|b| at[0] >= b[0] && at[0] <= b[2] && at[1] >= b[1] && at[1] <= b[3]) {
-                            annots.delete_annotation(a)?;
-                            removed = true;
-                            break;
-                        }
-                    }
-                    Ok(())
-                })();
-                if removed || result.is_err() {
-                    self.annotated(id, vec![page], false, result);
+            Edit::Note { page, at, text } => {
+                let Some(t) = self.text(id, page) else { return };
+                let (x, y) = t.to_page(at[0], at[1]);
+                ("Note added.", self.run_step(id, Step::AddAnnots(vec![AnnotSpec::Note { page, at: [x, y], text }])))
+            }
+            Edit::Ink { page, points, color, width } => {
+                let Some(t) = self.text(id, page) else { return };
+                let points: Vec<[f32; 2]> = points.iter().map(|p| t.to_page(p[0], p[1])).map(|(x, y)| [x, y]).collect();
+                if points.len() < 2 {
+                    return;
                 }
+                ("", self.run_step(id, Step::AddAnnots(vec![AnnotSpec::Ink { page, points, color, width }])))
             }
-            Req::Tile { .. } | Req::Thumb { .. } | Req::Text { .. } | Req::Search { .. } => {}
+            // The remaining edits have no cheap inverse: keep the document as it was.
+            Edit::Delete { mut pages } => {
+                pages.sort_unstable_by(|a, b| b.cmp(a));
+                pages.dedup();
+                let snapshot = self.snapshot(id);
+                self.drop_pages(id);
+                let result = snapshot.and_then(|bytes| {
+                    let d = self.docs.get(&id).ok_or(PdfiumError::PageIndexOutOfBounds)?;
+                    for &i in &pages {
+                        d.doc.pages().get(i as PdfPageIndex)?.delete()?;
+                    }
+                    Ok((Step::Restore(bytes), Changed::All))
+                });
+                ("", result)
+            }
+            Edit::Insert { path, at } => {
+                let snapshot = self.snapshot(id);
+                self.drop_pages(id);
+                let pdfium = self.pdfium;
+                let result = snapshot.and_then(|bytes| {
+                    let src = pdfium.load_pdf_from_file(&path, None)?;
+                    let count = src.pages().len();
+                    let d = self.docs.get_mut(&id).ok_or(PdfiumError::PageIndexOutOfBounds)?;
+                    d.doc.pages_mut().copy_pages_from_document(&src, &format!("1-{count}"), at.min(pages_len) as PdfPageIndex)?;
+                    Ok((Step::Restore(bytes), Changed::All))
+                });
+                ("Inserted.", result)
+            }
+            Edit::RemoveAnnot { page, at } => {
+                let Some(text) = self.text(id, page) else { return };
+                let (x, y) = text.to_page(at[0], at[1]);
+                let Some(p) = self.page(id, page) else { return };
+                let target = annots(p)
+                    .into_iter()
+                    .rev()
+                    .find(|a| a.rects.iter().any(|r| x >= r[0] - 2.0 && x <= r[2] + 2.0 && y >= r[1] - 2.0 && y <= r[3] + 2.0));
+                let Some(target) = target else { return };
+                let snapshot = self.snapshot(id);
+                self.drop_pages(id);
+                let result = snapshot.and_then(|bytes| {
+                    let d = self.docs.get(&id).ok_or(PdfiumError::PageIndexOutOfBounds)?;
+                    let p = d.doc.pages().get(page as PdfPageIndex)?;
+                    let b = p.bindings();
+                    unsafe { b.FPDFPage_RemoveAnnot(b.get_handle_from_page(&p), target.index) };
+                    Ok((Step::Restore(bytes), Changed::Pages(vec![page])))
+                });
+                ("Removed.", result)
+            }
+        };
+        match outcome {
+            Ok((inverse, changed)) => {
+                if let Some(d) = self.docs.get_mut(&id) {
+                    d.redo.clear();
+                    d.undo.push(inverse);
+                    // Keep the history within its step and memory limits, dropping the oldest.
+                    while d.undo.len() > UNDO_STEPS || d.undo.iter().map(Step::bytes).sum::<usize>() > UNDO_BYTES {
+                        d.undo.remove(0);
+                    }
+                }
+                self.changed(id, changed, note);
+            }
+            Err(e) => {
+                self.send(Resp::EditFailed { error: format!("{e:?}") });
+                // Some pages may already have changed, so lay everything out again.
+                self.changed(id, Changed::All, "");
+            }
         }
     }
 
-    fn annotated(&mut self, id: DocId, pages: Vec<u32>, added: bool, result: Result<(), PdfiumError>) {
+    /// Undo or redo: runs the newest step of one stack and files its inverse on the other.
+    fn history(&mut self, id: DocId, undo: bool) {
         let Some(d) = self.docs.get_mut(&id) else { return };
-        d.epoch += 1;
-        let epoch = d.epoch;
-        if let Err(e) = result {
-            self.send(Resp::EditFailed { error: format!("{e:?}") });
+        let Some(step) = (if undo { d.undo.pop() } else { d.redo.pop() }) else { return };
+        match self.run_step(id, step) {
+            Ok((inverse, changed)) => {
+                if let Some(d) = self.docs.get_mut(&id) {
+                    if undo { d.redo.push(inverse) } else { d.undo.push(inverse) }
+                }
+                self.changed(id, changed, if undo { "Undone." } else { "Redone." });
+            }
+            Err(e) => {
+                self.send(Resp::EditFailed { error: format!("{e:?}") });
+                self.changed(id, Changed::All, "");
+            }
         }
-        self.send(Resp::Annotated { id, epoch, pages, added });
     }
 
-    fn edited(&mut self, id: DocId, result: Result<(), PdfiumError>) {
-        let Some(d) = self.docs.get_mut(&id) else { return };
-        // Bump the epoch even on failure: some pages may already have changed.
-        d.epoch += 1;
-        let (epoch, sizes) = (d.epoch, sizes_of(&d.doc));
-        if let Err(e) = result {
-            self.send(Resp::EditFailed { error: format!("{e:?}") });
+    /// Runs one step and returns the step that reverses it.
+    fn run_step(&mut self, id: DocId, step: Step) -> Outcome {
+        self.drop_pages(id);
+        let missing = PdfiumError::PageIndexOutOfBounds;
+        match step {
+            Step::Rotate { pages, clockwise } => {
+                let d = self.docs.get(&id).ok_or(missing)?;
+                for &i in &pages {
+                    let mut p = d.doc.pages().get(i as PdfPageIndex)?;
+                    use PdfPageRenderRotation::*;
+                    let next = match (p.rotation()?, clockwise) {
+                        (None, true) | (Degrees180, false) => Degrees90,
+                        (Degrees90, true) | (Degrees270, false) => Degrees180,
+                        (Degrees180, true) | (None, false) => Degrees270,
+                        (Degrees270, true) | (Degrees90, false) => None,
+                    };
+                    p.set_rotation(next);
+                }
+                Ok((Step::Rotate { pages, clockwise: !clockwise }, Changed::All))
+            }
+            Step::Moves(moves) => {
+                let d = self.docs.get(&id).ok_or(missing)?;
+                let b = d.doc.bindings();
+                let handle = b.get_handle_from_document(&d.doc);
+                for &(from, to) in &moves {
+                    let index = [from as c_int];
+                    if !b.is_true(unsafe { b.FPDF_MovePages(handle, index.as_ptr(), 1, to as c_int) }) {
+                        return Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::Unknown));
+                    }
+                }
+                let back = moves.iter().rev().map(|&(from, to)| (to, from)).collect();
+                Ok((Step::Moves(back), Changed::All))
+            }
+            Step::AddAnnots(specs) => {
+                let d = self.docs.get(&id).ok_or(missing)?;
+                for spec in &specs {
+                    let mut p = d.doc.pages().get(spec.page() as PdfPageIndex)?;
+                    // Annotations live outside the page content, so leave the content alone.
+                    p.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
+                    create_annot(&p, spec)?;
+                }
+                let pages = specs.iter().map(AnnotSpec::page).collect();
+                Ok((Step::PopAnnots(specs), Changed::Pages(pages)))
+            }
+            Step::PopAnnots(specs) => {
+                let d = self.docs.get(&id).ok_or(missing)?;
+                for spec in specs.iter().rev() {
+                    let mut p = d.doc.pages().get(spec.page() as PdfPageIndex)?;
+                    p.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
+                    let b = p.bindings();
+                    let handle = b.get_handle_from_page(&p);
+                    unsafe {
+                        let count = b.FPDFPage_GetAnnotCount(handle);
+                        if count > 0 {
+                            b.FPDFPage_RemoveAnnot(handle, count - 1);
+                        }
+                    }
+                }
+                let pages = specs.iter().map(AnnotSpec::page).collect();
+                Ok((Step::AddAnnots(specs), Changed::Pages(pages)))
+            }
+            Step::Restore(bytes) => {
+                let current = self.snapshot(id)?;
+                let password = self.docs.get(&id).ok_or(missing)?.password.clone();
+                let doc = match self.pdfium.load_pdf_from_byte_vec(bytes.clone(), password.as_deref()) {
+                    Ok(doc) => doc,
+                    // A saved copy may no longer be encrypted.
+                    Err(_) => self.pdfium.load_pdf_from_byte_vec(bytes, None)?,
+                };
+                if let Some(d) = self.docs.get_mut(&id) {
+                    d.doc = doc;
+                }
+                Ok((Step::Restore(current), Changed::All))
+            }
         }
-        self.send(Resp::Edited { id, epoch, sizes });
+    }
+
+    /// Tells the UI what changed and what it can now undo and redo.
+    fn changed(&mut self, id: DocId, changed: Changed, note: &'static str) {
+        self.drop_pages(id);
+        let Some(d) = self.docs.get_mut(&id) else { return };
+        d.epoch += 1;
+        let resp = Resp::Edited {
+            id,
+            epoch: d.epoch,
+            sizes: sizes_of(&d.doc),
+            outline: outline_of(&d.doc),
+            pages: match changed {
+                Changed::All => None,
+                Changed::Pages(p) => Some(p),
+            },
+            note,
+            can_undo: !d.undo.is_empty(),
+            can_redo: !d.redo.is_empty(),
+        };
+        self.send(resp);
     }
 
     fn tile(&mut self, j: TileJob) {
