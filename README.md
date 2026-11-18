@@ -4,9 +4,13 @@ A fast PDF reader and editor for Windows. Rust, PDFium (the PDF engine in Chrome
 
 ![Shorui with a document open](docs/screenshots/reader.png)
 
-| Find and select | Highlight | Zoom to 6400% |
-| --- | --- | --- |
-| ![Find in document](docs/screenshots/find.png) | ![Highlighted text](docs/screenshots/highlight.png) | ![Zoomed in](docs/screenshots/zoom.png) |
+| Find and select | Highlight |
+| --- | --- |
+| ![Find in document](docs/screenshots/find.png) | ![Highlighted text](docs/screenshots/highlight.png) |
+
+| Zoom to 6400% | Settings |
+| --- | --- |
+| ![Zoomed in](docs/screenshots/zoom.png) | ![Settings window](docs/screenshots/settings.png) |
 
 ## Download
 
@@ -42,6 +46,7 @@ The built app is `target\release\shorui.exe`. It needs `pdfium.dll` beside it; t
 - Find in document: matches stream in as pages are searched, ignoring case and line breaks.
 - Select text by dragging, double-click a word, copy with Ctrl+C. Middle or right drag pans.
 - Highlight selected text with H or the toolbar marker. Right-click a highlight to remove it. Highlights are saved into the PDF as standard annotations.
+- Settings (the gear button, or Ctrl+,): zoom on open, thumbnails, highlight colour, updates and an about page.
 - Password-protected PDFs.
 - Drop files on the window to open them.
 
@@ -61,7 +66,14 @@ The built app is `target\release\shorui.exe`. It needs `pdfium.dll` beside it; t
 | Ctrl+C, Ctrl+A | Copy the selected text, select all text |
 | H | Highlight the selected text |
 | Ctrl+B | Show or hide thumbnails |
+| Ctrl+, | Settings |
 | Page Up/Down, Space, arrows, Home, End | Move through the document |
+
+## Updates and privacy
+
+Shorui has no account and no telemetry. The only network request it ever makes is the update check: one call to GitHub's public API for this repository's latest release, sending nothing but a `Shorui/<version>` user agent. It runs when you press "Check for updates" and, unless you turn it off in Settings, at most once a day when the app starts. If a newer version exists, Settings offers to download its installer and run it.
+
+Windows does not let an app make itself the default for a file type. "Make Shorui the default PDF app" in Settings opens Windows' own default-apps page for Shorui, where you confirm it.
 
 ## Installer
 
