@@ -133,6 +133,15 @@ fn register(o: &Opts, exe: &Path, uninstaller: &Path, size: u64) -> std::io::Res
     k.set_value("", &open_cmd)?;
     let (k, _) = hkcu.create_subkey(r"Software\Classes\Applications\shorui.exe\SupportedTypes")?;
     k.set_value(".pdf", &"")?;
+
+    // Lists Shorui on Windows' "Default apps" page, where the user can make it the default.
+    let (k, _) = hkcu.create_subkey(r"Software\Shorui\Capabilities")?;
+    k.set_value("ApplicationName", &"Shorui")?;
+    k.set_value("ApplicationDescription", &"A fast PDF reader and editor.")?;
+    let (k, _) = hkcu.create_subkey(r"Software\Shorui\Capabilities\FileAssociations")?;
+    k.set_value(".pdf", &"Shorui.pdf")?;
+    let (k, _) = hkcu.create_subkey(r"Software\RegisteredApplications")?;
+    k.set_value("Shorui", &r"Software\Shorui\Capabilities")?;
     Ok(())
 }
 
@@ -162,6 +171,10 @@ fn uninstall(o: &Opts, progress: &dyn Fn(&str, f32)) -> Result<(), String> {
         let _ = hkcu.delete_subkey_all(UNINSTALL_KEY);
         let _ = hkcu.delete_subkey_all(r"Software\Classes\Shorui.pdf");
         let _ = hkcu.delete_subkey_all(r"Software\Classes\Applications\shorui.exe");
+        let _ = hkcu.delete_subkey_all(r"Software\Shorui");
+        if let Ok(k) = hkcu.open_subkey_with_flags(r"Software\RegisteredApplications", winreg::enums::KEY_SET_VALUE) {
+            let _ = k.delete_value("Shorui");
+        }
         if let Ok(k) = hkcu.open_subkey_with_flags(r"Software\Classes\.pdf\OpenWithProgids", winreg::enums::KEY_SET_VALUE) {
             let _ = k.delete_value("Shorui.pdf");
         }
@@ -508,6 +521,14 @@ impl eframe::App for Setup {
                         ui.label(RichText::new("Shorui is gone from this PC.").font(theme::body()).color(muted));
                     }
                     ui.add_space(SPACE_4);
+                    if self.mode == Mode::Install && self.opts.register {
+                        if ui.link(RichText::new("Make Shorui the default PDF app").font(theme::body())).clicked() {
+                            let _ = std::process::Command::new("explorer.exe")
+                                .arg("ms-settings:defaultapps?registeredAppUser=Shorui")
+                                .spawn();
+                        }
+                        ui.add_space(SPACE_2);
+                    }
                     ui.horizontal(|ui| {
                         if self.mode == Mode::Install {
                             if ui.add_sized([128.0, 36.0], primary("Open Shorui")).clicked() {
