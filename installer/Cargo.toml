@@ -1,0 +1,17 @@
+[package]
+name = "shorui-setup"
+version = "0.1.0"
+edition = "2024"
+description = "Installer and uninstaller for Shorui"
+build = "build.rs"
+
+[dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.37.0"
+miniz_oxide = "0.9.1"
+mslnk = "0.1.8"
+winreg = "0.56.0"
+
+[build-dependencies]
+embed-resource = "3.0.12"
+miniz_oxide = "0.9.1"
