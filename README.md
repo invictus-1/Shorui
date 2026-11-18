@@ -12,7 +12,9 @@ A fast PDF reader and editor for Windows. Rust, PDFium (the PDF engine in Chrome
 | --- | --- |
 | ![Two pages side by side](docs/screenshots/two-page.png) | ![Settings window](docs/screenshots/settings.png) |
 
-<img src="docs/screenshots/zoom.png" alt="Zoomed to 400%" width="640">
+| Zoom to 6400% | Find in a scanned page (OCR) |
+| --- | --- |
+| ![Zoomed to 400%](docs/screenshots/zoom.png) | ![Search matches on a scanned page](docs/screenshots/ocr.png) |
 
 ## Download
 
@@ -48,6 +50,7 @@ The built app is `target\release\shorui.exe`. It needs `pdfium.dll` beside it; t
 - Find in document: matches stream in as pages are searched, ignoring case and line breaks.
 - Select text by dragging, double-click a word, copy with Ctrl+C. Middle or right drag pans.
 - Reopens your last tabs at the page and zoom you left them, and lists recent files on the empty window.
+- Scanned PDFs: pages with no text are read with OCR, so find, select, copy and annotations work on them too.
 - Password-protected PDFs. Drop files on the window to open them.
 
 **Annotate**
@@ -95,6 +98,12 @@ Shorui has no account and no telemetry. The only network request it ever makes i
 
 Windows does not let an app make itself the default for a file type. "Make Shorui the default PDF app" in Settings opens Windows' own default-apps page for Shorui, where you confirm it.
 
+## Scanned PDFs
+
+A page with no text of its own is rendered and read by the OCR engine built into Windows. It runs on your PC, needs no download, and reads the languages installed in Windows (Settings, Time & language, Language & region). Each page is read once per session, behind page rendering, so scrolling stays smooth; the first search of a long scan takes longer because every page has to be read. It can be switched off in Settings.
+
+It is good on clean printed scans and weaker on skewed, low-resolution or handwritten ones. A more accurate optional engine is on the [roadmap](ROADMAP.md).
+
 ## Installer
 
 `installer/` builds `Shorui Setup.exe`, one file that installs, updates and removes Shorui. It needs no administrator rights.
@@ -121,7 +130,7 @@ The result is `target\release\shorui-setup.exe`. Build the app first: the instal
 - Undo keeps cheap inverse steps where it can (rotate, move, add annotation) and falls back to a snapshot of the document only for edits with no inverse (delete, insert, remove annotation).
 - Printing draws each page straight onto the printer's device context, so output is vector, not a scaled bitmap.
 
-`src/app.rs` is the UI and view state. `src/settings.rs` holds preferences and the update check, `src/print.rs` the printing. `src/theme.rs` holds the design tokens from the Shorui design system.
+`src/app.rs` is the UI and view state. `src/settings.rs` holds preferences and the update check, `src/print.rs` the printing, `src/ocr.rs` the text recognition. `src/theme.rs` holds the design tokens from the Shorui design system.
 
 ## Measuring
 
