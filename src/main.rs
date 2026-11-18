@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod neural;
 mod ocr;
 mod print;
 mod render;
@@ -12,13 +13,13 @@ use std::{path::PathBuf, time::Instant};
 fn main() -> eframe::Result {
     let t0 = Instant::now();
     let mut files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    if files.is_empty() && std::env::var_os("SHORUI_SELFTEST").is_none() {
+    let saved = settings::Settings::load();
+    if files.is_empty() && std::env::var_os("SHORUI_SELFTEST").is_none() && saved.restore_session {
         // Nothing asked for: bring back the tabs from last time.
-        let saved = settings::Settings::load();
-        if saved.restore_session {
-            files = saved.session.into_iter().map(|s| s.0).filter(|p| p.exists()).collect();
-        }
+        files = saved.session.iter().map(|s| s.0.clone()).filter(|p| p.exists()).collect();
     }
+    // A neural OCR removal started last time finishes before anything can load its files.
+    neural::finish_removal();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Shorui")
@@ -31,7 +32,13 @@ fn main() -> eframe::Result {
     // Start PDFium and begin opening the files before the window exists, so the two overlap.
     let ctx = egui::Context::default();
     let gens = std::sync::Arc::new(render::Gens::default());
-    let (req, resp) = render::spawn(ctx.clone(), gens.clone());
+    gens.ocr.store(saved.ocr, std::sync::atomic::Ordering::Relaxed);
+    gens.night.store(saved.night, std::sync::atomic::Ordering::Relaxed);
+    let engine = match std::env::var("SHORUI_OCR_ENGINE").ok().and_then(|k| ocr::Kind::from_key(&k)) {
+        Some(k) => k,
+        None => saved.ocr_engine,
+    };
+    let (req, resp) = render::spawn(ctx.clone(), gens.clone(), engine);
     for (i, path) in files.iter().enumerate() {
         let _ = req.send(render::Req::Open { id: i as u64 + 1, path: path.clone(), password: None });
     }

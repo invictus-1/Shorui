@@ -193,6 +193,11 @@ pub enum Icon {
     Print,
     Pen,
     TwoPage,
+    Clock,
+    Moon,
+    Present,
+    Star,
+    StarFilled,
 }
 
 /// Draws a 16px outline icon centred on `c` with a 1.5px stroke.
@@ -299,6 +304,65 @@ pub fn paint_icon(p: &Painter, c: Pos2, icon: Icon, color: Color32) {
         Icon::TwoPage => {
             outline((-7.5, -6.0), (-1.0, 6.0), 1);
             outline((1.0, -6.0), (7.5, 6.0), 1);
+        }
+        Icon::Clock => {
+            p.circle_stroke(c, 6.5, s);
+            seg((0.0, 0.0), (0.0, -3.8));
+            seg((0.0, 0.0), (2.8, 1.6));
+        }
+        Icon::Moon => {
+            // A crescent: most of a circle, with a second circle biting into it from the upper right.
+            let (r0, c1, r1) = (6.5f32, (3.4f32, -2.8f32), 5.4f32);
+            let d = (c1.0 * c1.0 + c1.1 * c1.1).sqrt();
+            let a = (r0 * r0 - r1 * r1 + d * d) / (2.0 * d);
+            let base = c1.1.atan2(c1.0);
+            let th = (a / r0).clamp(-1.0, 1.0).acos();
+            let ph = ((d - a) / r1).clamp(-1.0, 1.0).acos();
+            let back = base + std::f32::consts::PI;
+            let mut pts: Vec<(f32, f32)> = (0..=28)
+                .map(|k| {
+                    let t = base + th + (std::f32::consts::TAU - 2.0 * th) * k as f32 / 28.0;
+                    (r0 * t.cos(), r0 * t.sin())
+                })
+                .collect();
+            let mut inner: Vec<(f32, f32)> = (0..=16)
+                .map(|k| {
+                    let t = back - ph + 2.0 * ph * k as f32 / 16.0;
+                    (c1.0 + r1 * t.cos(), c1.1 + r1 * t.sin())
+                })
+                .collect();
+            let end = pts[pts.len() - 1];
+            let dist = |p: (f32, f32)| (p.0 - end.0).powi(2) + (p.1 - end.1).powi(2);
+            if dist(inner[0]) > dist(inner[inner.len() - 1]) {
+                inner.reverse();
+            }
+            pts.extend(inner);
+            poly(&pts);
+        }
+        Icon::Present => {
+            outline((-7.5, -6.0), (7.5, 4.0), 2);
+            seg((0.0, 4.0), (0.0, 7.0));
+            seg((-3.5, 7.0), (3.5, 7.0));
+            poly(&[(-1.5, -3.5), (2.5, -1.0), (-1.5, 1.5), (-1.5, -3.5)]);
+        }
+        Icon::Star | Icon::StarFilled => {
+            let pts: Vec<Pos2> = (0..=10)
+                .map(|i| {
+                    let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
+                    let r = if i % 2 == 0 { 7.0 } else { 3.0 };
+                    at(r * a.cos(), r * a.sin() + 0.5)
+                })
+                .collect();
+            if icon == Icon::StarFilled {
+                // Filled as a fan of triangles from the centre: the star itself isn't convex.
+                for k in 0..5 {
+                    let tri = vec![c, pts[k * 2], pts[k * 2 + 1]];
+                    p.add(egui::Shape::convex_polygon(tri, color, Stroke::NONE));
+                    let tri = vec![c, pts[k * 2 + 1], pts[k * 2 + 2]];
+                    p.add(egui::Shape::convex_polygon(tri, color, Stroke::NONE));
+                }
+            }
+            p.line(pts, s);
         }
         Icon::Gear => {
             p.circle_stroke(c, 2.4, s);

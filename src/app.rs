@@ -12,6 +12,8 @@ use egui::{
 };
 
 use crate::{
+    neural,
+    ocr::Kind,
     render::{DocId, Edit, Gens, Link, Markup, OutlineItem, PageText, Req, Resp, TILE, line_rects},
     settings::{self, OpenZoom, Settings, Update},
     theme::{self, Icon, *},
@@ -58,11 +60,28 @@ struct Tile {
 
 type TileKey = (u32, u32, u32, u32);
 
-/// One search match: its page and one rectangle per line it spans, in page points.
+/// One search match: its page, one rectangle per line it spans (in page points), and the
+/// words around it for the results list.
 struct Hit {
     page: u32,
     rects: Vec<[f32; 4]>,
+    before: String,
+    matched: String,
+    after: String,
 }
+
+/// What the sidebar shows.
+#[derive(Clone, Copy, PartialEq)]
+enum SideTab {
+    Pages,
+    Outline,
+    Results,
+}
+
+/// Start screen card size.
+const CARD_W: f32 = 148.0;
+const COVER_H: f32 = 192.0;
+const CARD_H: f32 = COVER_H + 54.0;
 
 struct DocView {
     id: DocId,
@@ -143,6 +162,11 @@ struct DocView {
     active_hit: Option<usize>,
     search_done: bool,
     search_stamp: u64,
+    /// Search options: match case, whole words only.
+    case: bool,
+    whole: bool,
+    /// The page OCR is reading while the search waits for it.
+    search_reading: Option<u32>,
 }
 
 impl DocView {
@@ -210,6 +234,9 @@ impl DocView {
             active_hit: None,
             search_done: true,
             search_stamp: 0,
+            case: false,
+            whole: false,
+            search_reading: None,
         }
     }
 
@@ -472,9 +499,10 @@ fn start_search(d: &mut DocView, req: &Sender<Req>, gens: &Gens) {
     d.search_stamp = stamp;
     d.hits.clear();
     d.active_hit = None;
+    d.search_reading = None;
     d.search_done = d.query.trim().is_empty();
     if !d.search_done {
-        let _ = req.send(Req::Search { id: d.id, query: d.query.clone(), stamp });
+        let _ = req.send(Req::Search { id: d.id, query: d.query.clone(), stamp, case: d.case, whole: d.whole });
     }
 }
 
@@ -515,6 +543,67 @@ fn word_at(text: &PageText, i: u32) -> (u32, u32) {
     (a as u32, b as u32)
 }
 
+/// A small toggle button that shows text instead of an icon, for search options.
+fn text_toggle(ui: &mut Ui, text: &str, tip: &str, on: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(30.0, 28.0), Sense::click());
+    let p = ui.painter();
+    if on {
+        p.rect_filled(rect, CornerRadius::same(RADIUS_MD), ACCENT_DEEP);
+    } else if resp.hovered() {
+        p.rect_filled(rect, CornerRadius::same(RADIUS_MD), BG_300);
+    }
+    let color = if on || resp.hovered() { INK } else { INK_MUTED };
+    p.text(rect.center(), Align2::CENTER_CENTER, text, theme::label(), color);
+    if text == "ab" {
+        // "Whole word": a bracket under the letters.
+        let y = rect.center().y + 7.0;
+        p.line(
+            vec![pos2(rect.center().x - 8.0, y - 2.5), pos2(rect.center().x - 8.0, y), pos2(rect.center().x + 8.0, y), pos2(rect.center().x + 8.0, y - 2.5)],
+            Stroke::new(1.2, color),
+        );
+    }
+    resp.on_hover_text(tip)
+}
+
+/// A search result's text: a little before the match, the match picked out, a little after.
+fn snippet_job(h: &Hit, width: f32) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let mut job = LayoutJob::default();
+    let before: Vec<char> = h.before.chars().collect();
+    let keep = before.len().min(28);
+    let mut lead: String = before[before.len() - keep..].iter().collect();
+    if keep < before.len() {
+        lead = format!("\u{2026}{}", lead.trim_start());
+    }
+    let plain = TextFormat { font_id: theme::caption(), color: INK_MUTED, ..Default::default() };
+    let hit = TextFormat { font_id: theme::caption(), color: INK, background: ACCENT_DEEP, ..Default::default() };
+    job.append(&lead, 0.0, plain.clone());
+    job.append(&h.matched, 0.0, hit);
+    job.append(&h.after, 0.0, plain);
+    job.wrap = egui::text::TextWrapping { max_width: width, max_rows: 2, break_anywhere: false, overflow_character: Some('\u{2026}') };
+    job
+}
+
+/// One line of text cut to `width` with an ellipsis.
+fn elided(ui: &Ui, text: &str, font: egui::FontId, color: Color32, width: f32) -> Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, color);
+    job.wrap = egui::text::TextWrapping { max_width: width, max_rows: 1, break_anywhere: true, overflow_character: Some('\u{2026}') };
+    ui.painter().layout_job(job)
+}
+
+/// "3 min ago", "2 h ago", "5 days ago".
+fn ago(when: u64) -> String {
+    let secs = settings::now().saturating_sub(when);
+    match secs {
+        0..60 => "just now".into(),
+        60..3_600 => format!("{} min ago", secs / 60),
+        3_600..86_400 => format!("{} h ago", secs / 3_600),
+        86_400..172_800 => "yesterday".into(),
+        _ if secs < 60 * 86_400 => format!("{} days ago", secs / 86_400),
+        _ => format!("{} months ago", secs / (30 * 86_400)),
+    }
+}
+
 enum Action {
     OpenDialog,
     Open(PathBuf),
@@ -546,6 +635,17 @@ enum Action {
     InsertPdf(u32),
     Extract,
     TwoPage,
+    ReopenClosed,
+    ToggleNight,
+    Present(bool),
+    /// Next or previous page (or pair of pages) in presentation mode.
+    PresentStep(i32),
+    PinRecent(PathBuf),
+    ForgetRecent(PathBuf),
+    ClearRecent,
+    ShowInFolder(PathBuf),
+    Side(SideTab),
+    ShowHit(usize),
 }
 
 enum Confirm {
@@ -601,7 +701,21 @@ pub struct App {
     about_icon: Option<TextureHandle>,
     pen: bool,
     note_prompt: Option<(u32, Vec2, String)>,
-    side_outline: bool,
+    side_tab: SideTab,
+    /// Tabs closed this session, newest last, for Ctrl+Shift+T: file, page, zoom.
+    closed: Vec<(PathBuf, u32, f32)>,
+    /// First pages of recent files for the start screen, with their page counts.
+    covers: HashMap<PathBuf, (Option<TextureHandle>, u32)>,
+    cover_pending: HashSet<PathBuf>,
+    /// In presentation mode: the fit and zoom to return to.
+    present: Option<(Fit, f32)>,
+    /// Wheel movement collected in presentation mode, where the wheel turns pages.
+    wheel: f32,
+    pack_tx: std::sync::mpsc::Sender<neural::Progress>,
+    pack_rx: std::sync::mpsc::Receiver<neural::Progress>,
+    /// A neural OCR download in progress: the engine, bytes done, bytes in all.
+    ocr_download: Option<(Kind, u64, u64)>,
+    ocr_error: Option<String>,
 }
 
 impl App {
@@ -622,6 +736,7 @@ impl App {
         let settings = Settings::load();
         gens.ocr.store(settings.ocr, Ordering::Relaxed);
         let (update_tx, update_rx) = std::sync::mpsc::channel();
+        let (pack_tx, pack_rx) = std::sync::mpsc::channel();
         let selftest = std::env::var_os("SHORUI_SELFTEST").map(|d| SelfTest {
             dir: PathBuf::from(d),
             phase: 0,
@@ -666,12 +781,24 @@ impl App {
             about_icon: None,
             pen: false,
             note_prompt: None,
-            side_outline: false,
+            side_tab: SideTab::Pages,
+            closed: Vec::new(),
+            covers: HashMap::new(),
+            cover_pending: HashSet::new(),
+            present: None,
+            wheel: 0.0,
+            pack_tx,
+            pack_rx,
+            ocr_download: None,
+            ocr_error: None,
         };
         for f in files {
             let mut doc = DocView::new(app.next_id, f);
             doc.two_page = app.settings.two_page;
             doc.restore = app.settings.session.iter().find(|s| s.0 == doc.path).map(|s| (s.1, s.2));
+            if app.selftest.is_none() && doc.restore.is_none() {
+                doc.restore = app.settings.place(&doc.path);
+            }
             if app.selftest.is_none() {
                 app.settings.remember(&doc.path);
             }
@@ -679,6 +806,17 @@ impl App {
             app.next_id += 1;
         }
         app.active = app.docs.len().saturating_sub(1);
+        // Self-test only: install a neural engine through the real download path first.
+        if let (Some(_), Some(kind)) =
+            (&app.selftest, std::env::var("SHORUI_SELFTEST_INSTALL").ok().and_then(|k| Kind::from_key(&k)))
+        {
+            if neural::installed(kind) {
+                app.use_engine(kind);
+            } else {
+                app.ocr_download = Some((kind, 0, neural::download_size(kind)));
+                neural::install(kind, app.pack_tx.clone(), cc.egui_ctx.clone());
+            }
+        }
         if app.selftest.is_none() && !app.docs.is_empty() {
             app.settings.save();
         }
@@ -717,12 +855,14 @@ impl App {
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.docs.push(DocView::new(id, path.clone()));
-        self.docs.last_mut().unwrap().two_page = self.settings.two_page;
+        let mut doc = DocView::new(id, path.clone());
+        doc.two_page = self.settings.two_page;
         if self.selftest.is_none() {
+            doc.restore = self.settings.place(&path);
             self.settings.remember(&path);
             self.settings.save();
         }
+        self.docs.push(doc);
         let _ = self.req.send(Req::Open { id, path, password: None });
         self.activate(self.docs.len() - 1);
     }
@@ -742,10 +882,95 @@ impl App {
         }
         let d = self.docs.remove(i);
         let _ = self.req.send(Req::Close { id: d.id });
+        if d.error.is_none() && !d.loading && d.n() > 0 {
+            self.closed.push((d.path.clone(), d.current, d.zoom));
+            if self.selftest.is_none() {
+                self.settings.note_place(&d.path, d.current, d.zoom, d.n());
+                self.settings.save();
+            }
+        }
         if self.active > i || self.active >= self.docs.len() {
             self.active = self.active.saturating_sub(1);
         }
         self.invalidate_requests();
+    }
+
+    /// Night reading on or off. Every page image is drawn again in the new colours.
+    fn set_night(&mut self, on: bool) {
+        self.settings.night = on;
+        if self.selftest.is_none() {
+            self.settings.save();
+        }
+        self.gens.night.store(on, Ordering::Relaxed);
+        for d in &mut self.docs {
+            d.tiles.clear();
+            d.tile_bytes = 0;
+            d.thumbs.clear();
+            d.complete = false;
+        }
+        self.covers.clear();
+        self.cover_pending.clear();
+        self.invalidate_requests();
+    }
+
+    /// Presentation mode: full screen, one page (or pair) at a time, fitted and centred.
+    fn set_present(&mut self, ctx: &egui::Context, on: bool) {
+        let Some(d) = self.docs.get_mut(self.active).filter(|d| !d.loading && d.n() > 0) else { return };
+        match (on, self.present) {
+            (true, None) => {
+                self.present = Some((d.fit, d.zoom));
+                d.fit = Fit::Page;
+                d.sel = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+            }
+            (false, Some((fit, zoom))) => {
+                self.present = None;
+                let page = d.current;
+                d.fit = fit;
+                if fit == Fit::None {
+                    d.zoom = zoom;
+                }
+                d.go_to(page);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            }
+            _ => {}
+        }
+    }
+
+    /// Switches the OCR engine. Pages are read again by the new one as they are needed.
+    fn use_engine(&mut self, kind: Kind) {
+        self.settings.ocr_engine = kind;
+        let _ = self.req.send(Req::OcrEngine(kind));
+        if let Ok(mut s) = self.gens.ocr_status.lock() {
+            *s = Default::default();
+        }
+        for d in &mut self.docs {
+            d.texts.clear();
+            d.text_pending.clear();
+        }
+    }
+
+    /// Takes progress from a neural OCR download.
+    fn poll_download(&mut self, now: f64) {
+        while let Ok(p) = self.pack_rx.try_recv() {
+            match p {
+                neural::Progress::Bytes { done, total } => {
+                    if let Some(d) = &mut self.ocr_download {
+                        (d.1, d.2) = (done, total);
+                    }
+                }
+                neural::Progress::Done(kind) => {
+                    self.ocr_download = None;
+                    self.use_engine(kind);
+                    self.settings.save();
+                    self.say("Neural OCR is ready.", false, now);
+                }
+                neural::Progress::Failed(e) => {
+                    self.ocr_download = None;
+                    self.ocr_error = Some(e);
+                }
+            }
+        }
     }
 
     fn say(&mut self, text: impl Into<String>, error: bool, now: f64) {
@@ -804,7 +1029,13 @@ impl App {
                     if let Some(d) = self.doc_by_id(id) {
                         if d.search_stamp == stamp && d.hits.len() < 50_000 {
                             let first = d.hits.len();
-                            d.hits.extend(hits.into_iter().map(|rects| Hit { page, rects }));
+                            d.hits.extend(hits.into_iter().map(|f| Hit {
+                                page,
+                                rects: f.rects,
+                                before: f.before,
+                                matched: f.matched,
+                                after: f.after,
+                            }));
                             // Land on the first match at or after the page being read.
                             if d.active_hit.is_none() && page >= d.current {
                                 d.show_hit(first);
@@ -812,10 +1043,27 @@ impl App {
                         }
                     }
                 }
+                Resp::SearchReading { id, stamp, page } => {
+                    if let Some(d) = self.doc_by_id(id) {
+                        if d.search_stamp == stamp {
+                            d.search_reading = Some(page);
+                        }
+                    }
+                }
+                Resp::Cover { path, tex, pages } => {
+                    self.cover_pending.remove(&path);
+                    if pages > 0 {
+                        if let Some(r) = self.settings.recent.iter_mut().find(|r| r.path == path && r.pages == 0) {
+                            r.pages = pages;
+                        }
+                    }
+                    self.covers.insert(path, (tex, pages));
+                }
                 Resp::SearchDone { id, stamp } => {
                     if let Some(d) = self.doc_by_id(id) {
                         if d.search_stamp == stamp {
                             d.search_done = true;
+                            d.search_reading = None;
                             if d.active_hit.is_none() && !d.hits.is_empty() {
                                 d.show_hit(0);
                             }
@@ -902,7 +1150,38 @@ impl App {
             return;
         }
         let ctrl_shift = Modifiers::COMMAND | Modifiers::SHIFT;
+        if self.present.is_some() {
+            // Presentation mode: keys turn pages; Esc or F5 goes back.
+            ctx.input_mut(|i| {
+                if i.consume_key(Modifiers::NONE, Key::Escape) || i.consume_key(Modifiers::NONE, Key::F5) {
+                    actions.push(Action::Present(false));
+                }
+                for key in [Key::ArrowRight, Key::ArrowDown, Key::PageDown, Key::Space, Key::Enter, Key::N] {
+                    if i.consume_key(Modifiers::NONE, key) {
+                        actions.push(Action::PresentStep(1));
+                    }
+                }
+                for key in [Key::ArrowLeft, Key::ArrowUp, Key::PageUp, Key::Backspace, Key::P] {
+                    if i.consume_key(Modifiers::NONE, key) {
+                        actions.push(Action::PresentStep(-1));
+                    }
+                }
+                if i.consume_key(Modifiers::NONE, Key::Home) {
+                    actions.push(Action::GoTo(0));
+                }
+                if i.consume_key(Modifiers::NONE, Key::End) {
+                    actions.push(Action::GoTo(u32::MAX));
+                }
+            });
+            return;
+        }
         ctx.input_mut(|i| {
+            if i.consume_key(ctrl_shift, Key::T) {
+                actions.push(Action::ReopenClosed);
+            }
+            if i.consume_key(Modifiers::NONE, Key::F5) {
+                actions.push(Action::Present(true));
+            }
             if i.consume_key(Modifiers::COMMAND, Key::O) {
                 actions.push(Action::OpenDialog);
             }
@@ -1018,6 +1297,9 @@ impl App {
             if i.consume_key(Modifiers::NONE, Key::P) {
                 actions.push(Action::TogglePen);
             }
+            if i.consume_key(Modifiers::NONE, Key::N) {
+                actions.push(Action::ToggleNight);
+            }
             if d.sel.is_some() && i.consume_key(Modifiers::NONE, Key::U) {
                 actions.push(Action::Markup(Markup::Underline));
             }
@@ -1105,6 +1387,9 @@ impl App {
                 }
                 Action::SearchClose => {
                     self.gens.search.fetch_add(1, Ordering::Relaxed);
+                    if self.side_tab == SideTab::Results {
+                        self.side_tab = SideTab::Pages;
+                    }
                     if let Some(d) = self.doc() {
                         d.search_open = false;
                         d.hits.clear();
@@ -1202,6 +1487,51 @@ impl App {
                             d.relayout();
                             d.go_to(page);
                         }
+                    }
+                }
+                Action::ReopenClosed => {
+                    if let Some((path, page, zoom)) = self.closed.pop() {
+                        let before = self.next_id;
+                        self.open(path);
+                        if let Some(d) = self.docs.iter_mut().find(|d| d.id == before) {
+                            d.restore = Some((page, zoom));
+                        }
+                    }
+                }
+                Action::ToggleNight => {
+                    let on = !self.settings.night;
+                    self.set_night(on);
+                }
+                Action::Present(on) => self.set_present(ctx, on),
+                Action::PresentStep(dir) => {
+                    if let Some(d) = self.doc() {
+                        let rows = d.row_first.len() as i64;
+                        if rows > 0 {
+                            let row = d.row_of[d.current as usize] as i64;
+                            let next = (row + dir as i64).clamp(0, rows - 1) as usize;
+                            d.go_to(d.row_first[next]);
+                        }
+                    }
+                }
+                Action::PinRecent(path) => {
+                    if let Some(r) = self.settings.recent.iter_mut().find(|r| r.path == path) {
+                        r.pinned = !r.pinned;
+                    }
+                    self.settings.save();
+                }
+                Action::ForgetRecent(path) => {
+                    self.settings.recent.retain(|r| r.path != path);
+                    self.settings.save();
+                }
+                Action::ClearRecent => {
+                    self.settings.recent.retain(|r| r.pinned);
+                    self.settings.save();
+                }
+                Action::ShowInFolder(path) => settings::show_in_folder(&path),
+                Action::Side(tab) => self.side_tab = tab,
+                Action::ShowHit(i) => {
+                    if let Some(d) = self.doc() {
+                        d.show_hit(i);
                     }
                 }
                 Action::SelectAll => {
@@ -1321,6 +1651,29 @@ impl App {
             if theme::icon_button(ui, Icon::Plus, "Open  Ctrl+O", true, false).clicked() {
                 actions.push(Action::OpenDialog);
             }
+            if !self.docs.is_empty() {
+                let resp = theme::icon_button(ui, Icon::Clock, "Recent files", true, false);
+                egui::Popup::menu(&resp).show(|ui| {
+                    ui.set_min_width(260.0);
+                    let item = |text: &str| egui::Button::new(RichText::new(text).font(theme::body()));
+                    if ui.add_enabled(!self.closed.is_empty(), item("Reopen closed tab    Ctrl+Shift+T")).clicked() {
+                        actions.push(Action::ReopenClosed);
+                    }
+                    ui.separator();
+                    let mut any = false;
+                    for r in self.settings.recent.iter().filter(|r| r.path.exists()).take(12) {
+                        any = true;
+                        let name = r.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        let text = if r.pinned { format!("{name}  \u{2605}") } else { name };
+                        if ui.add(item(&text)).on_hover_text(r.path.display().to_string()).clicked() {
+                            actions.push(Action::Open(r.path.clone()));
+                        }
+                    }
+                    if !any {
+                        ui.add_enabled(false, item("No recent files"));
+                    }
+                });
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let resp = theme::icon_button(ui, Icon::Gear, "Settings  Ctrl+,", true, self.settings_open);
                 if matches!(self.update, Update::Available { .. }) {
@@ -1335,7 +1688,8 @@ impl App {
     }
 
     fn toolbar(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        let Self { docs, active, req, gens, pen, .. } = self;
+        let Self { docs, active, req, gens, pen, settings, .. } = self;
+        let night = settings.night;
         let doc = docs.get_mut(*active).filter(|d| !d.loading && d.error.is_none() && d.n() > 0);
         let has = doc.is_some();
         ui.horizontal_centered(|ui| {
@@ -1418,6 +1772,12 @@ impl App {
             if theme::icon_button(ui, Icon::TwoPage, "Two pages side by side  Ctrl+3", true, d.two_page).clicked() {
                 actions.push(Action::TwoPage);
             }
+            if theme::icon_button(ui, Icon::Moon, "Night reading  N", true, night).clicked() {
+                actions.push(Action::ToggleNight);
+            }
+            if theme::icon_button(ui, Icon::Present, "Present  F5", true, false).clicked() {
+                actions.push(Action::Present(true));
+            }
             sep(ui);
 
             let what = match d.selected.len() {
@@ -1458,19 +1818,39 @@ impl App {
             }
             if field.changed() {
                 start_search(d, req, gens);
+                if !d.query.trim().is_empty() {
+                    actions.push(Action::Side(SideTab::Results));
+                }
+            }
+            if text_toggle(ui, "Aa", "Match case", d.case).clicked() {
+                d.case = !d.case;
+                start_search(d, req, gens);
+            }
+            if text_toggle(ui, "ab", "Whole words only", d.whole).clicked() {
+                d.whole = !d.whole;
+                start_search(d, req, gens);
             }
             if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                 // Enter steps through matches and keeps the field ready for the next Enter.
                 actions.push(Action::SearchStep(if ui.input(|i| i.modifiers.shift) { -1 } else { 1 }));
                 d.focus_search = true;
             }
+            let reading = d.search_reading.filter(|_| !d.search_done).map(|p| format!("reading page {} of {}", p + 1, d.n()));
             let status = if d.query.trim().is_empty() {
                 String::new()
             } else if d.hits.is_empty() {
-                if d.search_done { "No results".to_string() } else { "Searching".to_string() }
+                match (&reading, d.search_done) {
+                    (_, true) => "No results".to_string(),
+                    (Some(r), false) => format!("Searching, {r}"),
+                    (None, false) => "Searching".to_string(),
+                }
             } else {
                 let at = d.active_hit.map(|a| a + 1).unwrap_or(0);
-                format!("{at} / {}{}", d.hits.len(), if d.search_done { "" } else { "+" })
+                let more = if d.search_done { "" } else { "+" };
+                match reading {
+                    Some(r) => format!("{at} / {}{more}, {r}", d.hits.len()),
+                    None => format!("{at} / {}{more}", d.hits.len()),
+                }
             };
             ui.label(RichText::new(status).font(theme::readout()).color(INK_MUTED));
             let any = !d.hits.is_empty();
@@ -1487,7 +1867,7 @@ impl App {
     }
 
     fn sidebar(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        let Self { docs, active, side_outline, .. } = self;
+        let Self { docs, active, side_tab, .. } = self;
         let Some(d) = docs.get_mut(*active) else { return };
         if d.loading || d.n() == 0 {
             return;
@@ -1495,30 +1875,88 @@ impl App {
         let n = d.n();
         let width = ui.available_width();
 
-        // Pages or outline, when the document has an outline.
+        // Pages, plus outline and search results when there are any.
+        let mut tabs = vec![(SideTab::Pages, "Pages")];
         if !d.outline.is_empty() {
+            tabs.push((SideTab::Outline, "Outline"));
+        }
+        if d.search_open && !d.query.trim().is_empty() {
+            tabs.push((SideTab::Results, "Results"));
+        }
+        let tab = if tabs.iter().any(|t| t.0 == *side_tab) { *side_tab } else { SideTab::Pages };
+        if tabs.len() > 1 {
             ui.add_space(SPACE_2);
             ui.horizontal(|ui| {
                 ui.add_space(SPACE_2);
                 ui.spacing_mut().item_spacing.x = SPACE_1;
-                for (outline, text) in [(false, "Pages"), (true, "Outline")] {
-                    let on = *side_outline == outline;
-                    let (rect, resp) = ui.allocate_exact_size(vec2((width - 20.0) / 2.0, 26.0), Sense::click());
+                let w = (width - SPACE_2 * 2.0 - SPACE_1 * (tabs.len() - 1) as f32) / tabs.len() as f32;
+                for (value, text) in &tabs {
+                    let on = tab == *value;
+                    let (rect, resp) = ui.allocate_exact_size(vec2(w, 26.0), Sense::click());
                     if on {
                         ui.painter().rect_filled(rect, CornerRadius::same(RADIUS_MD), ACCENT_DEEP);
                     } else if resp.hovered() {
                         ui.painter().rect_filled(rect, CornerRadius::same(RADIUS_MD), BG_300);
                     }
                     let color = if on || resp.hovered() { INK } else { INK_MUTED };
-                    ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, theme::label(), color);
+                    ui.painter().text(rect.center(), Align2::CENTER_CENTER, *text, theme::label(), color);
                     if resp.clicked() {
-                        *side_outline = outline;
+                        *side_tab = *value;
                     }
                 }
             });
             ui.add_space(SPACE_1);
         }
-        if *side_outline && !d.outline.is_empty() {
+        if tab == SideTab::Results {
+            let status = if d.hits.is_empty() && d.search_done {
+                "No results".to_string()
+            } else if let Some(p) = d.search_reading.filter(|_| !d.search_done) {
+                format!("{} so far, reading page {}", d.hits.len(), p + 1)
+            } else if d.search_done {
+                if d.hits.len() == 1 { "1 result".to_string() } else { format!("{} results", d.hits.len()) }
+            } else {
+                format!("{} so far", d.hits.len())
+            };
+            ui.horizontal(|ui| {
+                ui.add_space(SPACE_3);
+                ui.label(RichText::new(status).font(theme::caption()).color(INK_MUTED));
+            });
+            let active_hit = d.active_hit;
+            egui::ScrollArea::vertical().id_salt(("results", d.id)).auto_shrink(false).show_rows(
+                ui,
+                60.0,
+                d.hits.len(),
+                |ui, range| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for i in range {
+                        let h = &d.hits[i];
+                        let (rect, resp) = ui.allocate_exact_size(vec2(width, 60.0), Sense::click());
+                        let row = rect.shrink2(vec2(SPACE_1, 2.0));
+                        let on = active_hit == Some(i);
+                        if on {
+                            ui.painter().rect_filled(row, CornerRadius::same(RADIUS_MD), ACCENT_DEEP);
+                        } else if resp.hovered() {
+                            ui.painter().rect_filled(row, CornerRadius::same(RADIUS_MD), BG_300);
+                        }
+                        let inner = row.shrink2(vec2(SPACE_2, SPACE_1));
+                        ui.painter().text(
+                            inner.min,
+                            Align2::LEFT_TOP,
+                            format!("Page {}", h.page + 1),
+                            theme::caption(),
+                            if on { INK } else { INK_MUTED },
+                        );
+                        let galley = ui.painter().layout_job(snippet_job(h, inner.width()));
+                        ui.painter().galley(inner.min + vec2(0.0, 16.0), galley, INK);
+                        if resp.clicked() {
+                            actions.push(Action::ShowHit(i));
+                        }
+                    }
+                },
+            );
+            return;
+        }
+        if tab == SideTab::Outline {
             let current = d.current;
             // The entry being read: the last one that starts at or before the current page.
             let reading = d.outline.iter().rposition(|o| o.page.is_some_and(|p| p <= current));
@@ -1699,16 +2137,27 @@ impl App {
     }
 
     fn empty_state(&mut self, ui: &mut Ui, rect: Rect, actions: &mut Vec<Action>) {
-        let recent: Vec<PathBuf> = self.settings.recent.iter().filter(|p| p.exists()).take(6).cloned().collect();
-        let c = rect.center() - vec2(0.0, recent.len() as f32 * 16.0);
-        let p = ui.painter();
         if let Some(e) = &self.fatal {
-            p.text(c, Align2::CENTER_CENTER, e, theme::body(), DANGER);
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, e, theme::body(), DANGER);
             return;
         }
-        p.text(c - vec2(0.0, 44.0), Align2::CENTER_CENTER, "Drop a PDF anywhere", theme::display(), INK);
-        p.text(c - vec2(0.0, 10.0), Align2::CENTER_CENTER, "or open one with Ctrl+O", theme::body(), INK_MUTED);
-        let button = Rect::from_center_size(c + vec2(0.0, 36.0), vec2(96.0, 32.0));
+        // Pinned files first, then the rest, newest first; only files that still exist.
+        let mut recent: Vec<settings::Recent> = self.settings.recent.iter().filter(|r| r.path.exists()).cloned().collect();
+        recent.sort_by_key(|r| !r.pinned);
+        let gap = SPACE_6;
+        let cols = (((rect.width() - 2.0 * SPACE_6 + gap) / (CARD_W + gap)).floor() as usize).clamp(1, 6);
+        let rows = if rect.height() > 760.0 { 2 } else { 1 };
+        recent.truncate(cols * rows);
+        let grid_rows = recent.len().div_ceil(cols.max(1));
+        let header_h = 150.0;
+        let grid_h = if recent.is_empty() { 0.0 } else { 40.0 + grid_rows as f32 * (CARD_H + gap) - gap };
+        let top = rect.min.y + ((rect.height() - header_h - grid_h) / 2.0).max(SPACE_6);
+        let cx = rect.center().x;
+
+        let p = ui.painter();
+        p.text(pos2(cx, top + 20.0), Align2::CENTER_CENTER, "Drop a PDF anywhere", theme::display(), INK);
+        p.text(pos2(cx, top + 54.0), Align2::CENTER_CENTER, "or open one with Ctrl+O", theme::body(), INK_MUTED);
+        let button = Rect::from_center_size(pos2(cx, top + 100.0), vec2(96.0, 32.0));
         let resp = ui.interact(button, Id::unique("empty-open"), Sense::click());
         let p = ui.painter();
         p.rect_filled(button, CornerRadius::same(RADIUS_MD), ACCENT);
@@ -1719,34 +2168,123 @@ impl App {
         if resp.clicked() {
             actions.push(Action::OpenDialog);
         }
-
-        // Recent files, newest first.
         if recent.is_empty() {
             return;
         }
-        let mut y = button.max.y + 32.0;
-        ui.painter().text(pos2(c.x, y), Align2::CENTER_CENTER, "Recent", theme::label(), INK_MUTED);
-        y += SPACE_4;
-        for path in recent {
-            let row = Rect::from_min_size(pos2(c.x - 190.0, y), vec2(380.0, 30.0));
-            let resp = ui.interact(row, Id::unique(("recent", &path)), Sense::click());
-            let p = ui.painter();
-            if resp.hovered() {
-                p.rect_filled(row, CornerRadius::same(RADIUS_MD), BG_300);
+
+        // Recent files as cards: first page, name, and where you were.
+        let row_w = cols.min(recent.len()) as f32 * (CARD_W + gap) - gap;
+        let left = cx - row_w / 2.0;
+        let label_y = top + header_h;
+        ui.painter().text(pos2(left, label_y), Align2::LEFT_CENTER, "Recent", theme::label(), INK_MUTED);
+        let clear = Rect::from_min_size(pos2(left + row_w - 80.0, label_y - 12.0), vec2(80.0, 24.0));
+        if recent.iter().any(|r| !r.pinned) {
+            let cresp = ui.interact(clear, Id::unique("recent-clear"), Sense::click());
+            let color = if cresp.hovered() { INK } else { INK_MUTED };
+            ui.painter().text(clear.right_center(), Align2::RIGHT_CENTER, "Clear list", theme::caption(), color);
+            if cresp.on_hover_text("Forget recent files that aren't pinned").clicked() {
+                actions.push(Action::ClearRecent);
             }
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            p.with_clip_rect(row.shrink2(vec2(SPACE_3, 0.0))).text(
-                pos2(row.min.x + SPACE_3, row.center().y),
-                Align2::LEFT_CENTER,
-                name,
-                theme::body(),
-                if resp.hovered() { INK } else { INK_MUTED },
+        }
+        let ppp = ui.ctx().pixels_per_point();
+        for (k, r) in recent.iter().enumerate() {
+            let (col, row) = ((k % cols) as f32, (k / cols) as f32);
+            let card = Rect::from_min_size(
+                pos2(left + col * (CARD_W + gap), label_y + 24.0 + row * (CARD_H + gap)),
+                vec2(CARD_W, CARD_H),
             );
-            if resp.clicked() {
-                actions.push(Action::Open(path.clone()));
+            let resp = ui.interact(card.expand(SPACE_2), Id::unique(("recent", &r.path)), Sense::click());
+            let hovered = resp.hovered();
+            let p = ui.painter();
+            if hovered {
+                p.rect_filled(card.expand(SPACE_2), CornerRadius::same(RADIUS_LG), BG_300);
             }
-            resp.on_hover_text(path.display().to_string());
-            y += 32.0;
+            let slot = Rect::from_min_size(card.min, vec2(CARD_W, COVER_H));
+            match self.covers.get(&r.path) {
+                Some((Some(tex), _)) => {
+                    // The page, as large as fits, standing on the slot's bottom edge.
+                    let [tw, th] = tex.size();
+                    let k = (CARD_W / tw as f32).min(COVER_H / th as f32);
+                    let size = vec2(tw as f32, th as f32) * k;
+                    let img = Rect::from_min_size(pos2(slot.center().x - size.x / 2.0, slot.max.y - size.y), size);
+                    p.image(tex.id(), img, UV, Color32::WHITE);
+                    p.rect_stroke(img, 0, Stroke::new(1.0, LINE), StrokeKind::Outside);
+                    // How far through the document you got.
+                    let pages = r.pages.max(self.covers.get(&r.path).map(|c| c.1).unwrap_or(0));
+                    if pages > 1 && r.page > 0 {
+                        let frac = (r.page + 1) as f32 / pages as f32;
+                        let bar = Rect::from_min_max(pos2(img.min.x, img.max.y - 3.0), img.max);
+                        p.rect_filled(bar, 0, Color32::from_black_alpha(140));
+                        p.rect_filled(Rect::from_min_max(bar.min, pos2(bar.min.x + bar.width() * frac, bar.max.y)), 0, ACCENT);
+                    }
+                }
+                Some((None, _)) => {
+                    // Locked or unreadable: a plain card.
+                    p.rect_filled(slot.shrink2(vec2(18.0, 0.0)), CornerRadius::same(RADIUS_SM), BG_300);
+                    p.text(slot.center(), Align2::CENTER_CENTER, "PDF", theme::label(), INK_MUTED);
+                }
+                None => {
+                    p.rect_filled(slot.shrink2(vec2(18.0, 0.0)), CornerRadius::same(RADIUS_SM), BG_200);
+                    if self.cover_pending.insert(r.path.clone()) {
+                        let width = ((CARD_W * ppp).round() as u32).max(96);
+                        let _ = self.req.send(Req::Cover { path: r.path.clone(), width });
+                    }
+                }
+            }
+            let name = r.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let galley = elided(ui, &name, theme::body(), if hovered { INK } else { INK }, CARD_W);
+            ui.painter().galley(pos2(card.min.x, slot.max.y + SPACE_2), galley, INK);
+            let pages = r.pages.max(self.covers.get(&r.path).map(|c| c.1).unwrap_or(0));
+            let place = if r.page > 0 && pages > 0 {
+                format!("Page {} of {}", r.page + 1, pages)
+            } else if pages > 0 {
+                if pages == 1 { "1 page".to_string() } else { format!("{pages} pages") }
+            } else {
+                String::new()
+            };
+            let meta = match (place.is_empty(), r.opened) {
+                (true, 0) => String::new(),
+                (true, t) => ago(t),
+                (false, 0) => place,
+                (false, t) => format!("{place} \u{b7} {}", ago(t)),
+            };
+            let galley = elided(ui, &meta, theme::caption(), INK_MUTED, CARD_W);
+            ui.painter().galley(pos2(card.min.x, slot.max.y + SPACE_2 + 22.0), galley, INK_MUTED);
+
+            // Pin button on the cover: always shown for pinned files, on hover for the rest.
+            let pin = Rect::from_center_size(pos2(slot.max.x - 16.0, slot.min.y + 16.0), Vec2::splat(26.0));
+            let pin_resp = ui.interact(pin, Id::unique(("pin", &r.path)), Sense::click());
+            if r.pinned || hovered || pin_resp.hovered() {
+                let p = ui.painter();
+                p.circle_filled(pin.center(), 13.0, Color32::from_rgba_unmultiplied(11, 10, 15, 220));
+                let (icon, color) = if r.pinned { (Icon::StarFilled, ACCENT_BRIGHT) } else { (Icon::Star, if pin_resp.hovered() { INK } else { INK_MUTED }) };
+                theme::paint_icon(p, pin.center(), icon, color);
+            }
+            if pin_resp.on_hover_text(if r.pinned { "Unpin" } else { "Pin to the start screen" }).clicked() {
+                actions.push(Action::PinRecent(r.path.clone()));
+            } else if resp.clicked() {
+                actions.push(Action::Open(r.path.clone()));
+            }
+            let path = r.path.clone();
+            let pinned = r.pinned;
+            egui::Popup::context_menu(&resp).show(|ui| {
+                ui.set_min_width(200.0);
+                let item = |text: &str| egui::Button::new(RichText::new(text).font(theme::body()));
+                if ui.add(item("Open")).clicked() {
+                    actions.push(Action::Open(path.clone()));
+                }
+                if ui.add(item(if pinned { "Unpin" } else { "Pin to the start screen" })).clicked() {
+                    actions.push(Action::PinRecent(path.clone()));
+                }
+                if ui.add(item("Show in folder")).clicked() {
+                    actions.push(Action::ShowInFolder(path.clone()));
+                }
+                ui.separator();
+                if ui.add(item("Remove from this list")).clicked() {
+                    actions.push(Action::ForgetRecent(path.clone()));
+                }
+            });
+            resp.on_hover_text(r.path.display().to_string());
         }
     }
 
@@ -1761,8 +2299,10 @@ impl App {
         let ppp = ui.ctx().pixels_per_point();
         let now = ui.input(|i| i.time);
         let frame = self.frame;
-        let Self { docs, req, gens, active, settings, pen, .. } = self;
+        let Self { docs, req, gens, active, settings, pen, present, wheel, .. } = self;
         let pen = *pen;
+        let present = present.is_some();
+        let paper = if settings.night { Color32::from_rgb(22, 22, 22) } else { PAGE };
         let Some(d) = docs.get_mut(*active) else { return };
         let painter = ui.painter_at(rect);
         if let Some(e) = &d.error {
@@ -1803,7 +2343,21 @@ impl App {
 
         // Input: wheel scrolls, Ctrl+wheel and pinch zoom around the pointer, left drag selects
         // text, middle or right drag pans.
-        if resp.contains_pointer() {
+        if present {
+            // The page (or pair) being shown, centred.
+            if resp.contains_pointer() {
+                *wheel += ui.input(|i| i.smooth_scroll_delta.y);
+                if wheel.abs() > 60.0 {
+                    actions.push(Action::PresentStep(if *wheel < 0.0 { 1 } else { -1 }));
+                    *wheel = 0.0;
+                }
+            }
+            let row = d.row_of[d.current as usize] as usize;
+            let h = (d.row_top[row + 1] - d.row_top[row]) * d.zoom * PT;
+            d.scroll.y = d.top(d.current, d.zoom) - (d.view.y - h) / 2.0;
+            d.scroll.x = (d.content_w(d.zoom) - d.view.x) / 2.0;
+            d.clamp_scroll();
+        } else if resp.contains_pointer() {
             let (scroll, zoom_delta, pos) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.pointer.hover_pos()));
             if zoom_delta != 1.0 {
                 d.fit = Fit::None;
@@ -1823,7 +2377,7 @@ impl App {
 
         // Scrollbar.
         let total = d.total_h();
-        let bar = (total > d.view.y + 1.0).then(|| {
+        let bar = (total > d.view.y + 1.0 && !present).then(|| {
             let track = Rect::from_min_max(pos2(rect.max.x - 12.0, rect.min.y), rect.max);
             let sresp = ui.interact(track, Id::unique(("vscroll", d.id)), Sense::click_and_drag());
             let thumb_h = (d.view.y * d.view.y / total).max(36.0);
@@ -1838,7 +2392,7 @@ impl App {
             Rect::from_min_size(pos2(rect.max.x - w - 2.0, y), vec2(w, thumb_h))
         });
 
-        let current = d.page_at(d.scroll.y + d.view.y * 0.35);
+        let current = if present { d.current } else { d.page_at(d.scroll.y + d.view.y * 0.35) };
         if current != d.current {
             d.current = current;
             d.side_scroll_to = Some(current);
@@ -1912,7 +2466,7 @@ impl App {
             }
 
             if on_screen {
-                painter.rect_filled(prect, 0, PAGE);
+                painter.rect_filled(prect, 0, paper);
                 if let Some(t) = d.thumbs.get(&i) {
                     painter.image(t.id(), prect, UV, Color32::WHITE);
                 }
@@ -1996,6 +2550,14 @@ impl App {
                 }
             });
         }
+        if present {
+            // Click for the next page, right-click for the one before; links still work.
+            if resp.secondary_clicked() {
+                actions.push(Action::PresentStep(-1));
+            } else if resp.clicked() && link.is_none() {
+                actions.push(Action::PresentStep(1));
+            }
+        }
         if resp.clicked() {
             d.sel = None;
             match &link {
@@ -2025,7 +2587,8 @@ impl App {
         });
         let has_sel = d.sel.is_some();
         let menu_at = d.menu_at;
-        egui::Popup::context_menu(&resp).show(|ui| {
+        let menu = if present { None } else { Some(&resp) };
+        menu.map(|resp| egui::Popup::context_menu(resp).show(|ui| {
             ui.set_min_width(210.0);
             let item = |text: &str| egui::Button::new(RichText::new(text).font(theme::body()));
             if ui.add_enabled(has_sel, item("Copy    Ctrl+C")).clicked() {
@@ -2052,14 +2615,14 @@ impl App {
                     actions.push(Action::Unhighlight(page, at));
                 }
             }
-        });
+        }));
         if resp.double_clicked() {
             if let Some((page, c)) = pointer.and_then(|p| locate(d, p, false)) {
                 let (a, b) = word_at(&d.texts[&page], c);
                 d.sel = Some(((page, a), (page, b)));
             }
         }
-        if resp.drag_started_by(egui::PointerButton::Primary) {
+        if resp.drag_started_by(egui::PointerButton::Primary) && !present {
             let origin = ui.input(|i| i.pointer.press_origin()).or(pointer);
             if pen {
                 // Start a stroke on the page under the pointer.
@@ -2252,10 +2815,13 @@ impl App {
         let primary =
             |text: &str| egui::Button::new(RichText::new(text).font(theme::label()).color(ON_ACCENT)).fill(ACCENT);
         let plain = |text: &str| egui::Button::new(RichText::new(text).font(theme::label()));
+        let max_h = (ctx.content_rect().height() - 120.0).max(240.0);
         let modal = egui::Modal::new(Id::unique("settings")).frame(theme::modal_frame()).show(ctx, |ui| {
-            ui.set_width(440.0);
+            ui.set_width(460.0);
             ui.spacing_mut().item_spacing.y = SPACE_2;
             ui.label(RichText::new("Settings").font(theme::title()));
+            egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+            ui.set_width(452.0);
 
             section(ui, "When a PDF opens");
             ui.horizontal(|ui| {
@@ -2269,9 +2835,18 @@ impl App {
                     }
                 }
             });
+            ui.checkbox(
+                &mut self.settings.restore_session,
+                RichText::new("Reopen the last tabs when Shorui starts").font(theme::body()),
+            );
+            if ui.checkbox(&mut self.settings.sidebar, RichText::new("Show page thumbnails").font(theme::body())).changed() {
+                self.sidebar = self.settings.sidebar;
+            }
+
+            section(ui, "Scanned pages");
             if ui
                 .checkbox(&mut self.settings.ocr, RichText::new("Read scanned pages with OCR").font(theme::body()))
-                .on_hover_text("Lets you find, select and highlight text in scans. Runs on this PC, in the languages installed in Windows.")
+                .on_hover_text("Lets you find, select and highlight text in scans. Runs on this PC.")
                 .changed()
             {
                 self.gens.ocr.store(self.settings.ocr, Ordering::Relaxed);
@@ -2281,12 +2856,66 @@ impl App {
                     d.text_pending.clear();
                 }
             }
-            ui.checkbox(
-                &mut self.settings.restore_session,
-                RichText::new("Reopen the last tabs when Shorui starts").font(theme::body()),
+            let busy = self.ocr_download.is_some();
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(SPACE_2, SPACE_2);
+                for (kind, name) in [(Kind::Windows, "Windows"), (Kind::Latin, "Neural: Latin"), (Kind::Cjk, "Neural: Chinese & Japanese")] {
+                    let on = self.settings.ocr_engine == kind;
+                    let size = neural::download_size(kind);
+                    let text = if kind.neural() && !neural::installed(kind) {
+                        format!("{name}, {} MB download", size.div_ceil(1 << 20))
+                    } else {
+                        name.to_string()
+                    };
+                    let button = if on { primary(&text) } else { plain(&text) };
+                    if ui.add_enabled(self.settings.ocr && (!busy || on), button).clicked() && !on {
+                        self.ocr_error = None;
+                        if neural::installed(kind) || !kind.neural() {
+                            self.use_engine(kind);
+                        } else {
+                            self.ocr_download = Some((kind, 0, size));
+                            neural::install(kind, self.pack_tx.clone(), ctx.clone());
+                        }
+                    }
+                }
+            });
+            if let Some((_, done, total)) = self.ocr_download {
+                let mb = |b: u64| b as f32 / (1 << 20) as f32;
+                ui.add(
+                    egui::ProgressBar::new(if total > 0 { done as f32 / total as f32 } else { 0.0 })
+                        .desired_height(6.0)
+                        .fill(ACCENT),
+                );
+                ui.label(RichText::new(format!("Downloading {:.0} of {:.0} MB", mb(done), mb(total))).font(theme::caption()).color(INK_MUTED));
+            } else if let Some(e) = &self.ocr_error {
+                ui.label(RichText::new(e).font(theme::caption()).color(DANGER));
+            } else {
+                let status = self.gens.ocr_status.lock().map(|s| s.clone()).unwrap_or_default();
+                let (text, color) = if !status.text.is_empty() {
+                    (status.text, if status.error { DANGER } else { INK_MUTED })
+                } else if self.settings.ocr_engine.neural() {
+                    ("Neural OCR starts when a scanned page needs reading.".to_string(), INK_MUTED)
+                } else {
+                    ("Windows OCR reads in the languages installed in Windows.".to_string(), INK_MUTED)
+                };
+                ui.label(RichText::new(text).font(theme::caption()).color(color));
+            }
+            ui.label(
+                RichText::new(
+                    "The neural engines read poor scans better and place every character exactly. They are a one-time \
+                     download from Shorui's GitHub releases, checked against a fixed checksum, and run on this PC, on the \
+                     graphics card when it can. Nothing you read is sent anywhere.",
+                )
+                .font(theme::caption())
+                .color(INK_MUTED),
             );
-            if ui.checkbox(&mut self.settings.sidebar, RichText::new("Show page thumbnails").font(theme::body())).changed() {
-                self.sidebar = self.settings.sidebar;
+            if !busy && (neural::installed(Kind::Latin) || neural::installed(Kind::Cjk)) {
+                if ui.link(RichText::new("Remove the downloaded engines").font(theme::caption())).clicked() {
+                    if self.settings.ocr_engine.neural() {
+                        self.use_engine(Kind::Windows);
+                    }
+                    neural::remove();
+                }
             }
 
             section(ui, "Highlight colour");
@@ -2374,6 +3003,7 @@ impl App {
                 });
             });
 
+            });
             ui.add_space(SPACE_3);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add(primary("Done")).clicked() {
@@ -2550,11 +3180,33 @@ impl App {
 
     fn run_selftest(&mut self, ctx: &egui::Context, ui_time: Duration) {
         let Some(t) = &mut self.selftest else { return };
+        if std::env::var_os("SHORUI_SELFTEST_HOME").is_some() {
+            // The start screen with recent files from the settings in SHORUI_CONFIG_DIR.
+            ctx.request_repaint();
+            t.frames += 1;
+            match t.phase {
+                0 if t.frames > 5 && self.cover_pending.is_empty() && !self.covers.is_empty() => {
+                    t.log += &format!("start screen: {} recent files, {} covers\n", self.settings.recent.len(), self.covers.len());
+                    let (dir, shots) = (t.dir.clone(), t.shots.clone());
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |img| {
+                        let _ = write_bmp(&dir.join("home.bmp"), &img);
+                        shots.fetch_add(1, Ordering::Relaxed);
+                    })));
+                    t.phase = 1;
+                }
+                1 if t.shots.load(Ordering::Relaxed) >= 1 => {
+                    let _ = std::fs::write(t.dir.join("log.txt"), &t.log);
+                    std::process::exit(0);
+                }
+                _ => {}
+            }
+            return;
+        }
         let Some(d) = self.docs.get_mut(self.active) else { return };
         if let Some(word) = std::env::var_os("SHORUI_SELFTEST_OCR") {
             ctx.request_repaint();
             match t.phase {
-                0 if !d.loading && d.complete && d.texts.contains_key(&0) => {
+                0 if !d.loading && d.complete && d.texts.contains_key(&0) && self.ocr_download.is_none() => {
                     let x = &d.texts[&0];
                     let sample: String = x.chars.iter().take(70).filter(|c| **c != '\r' && **c != '\n').collect();
                     t.log += &format!(
@@ -2581,6 +3233,8 @@ impl App {
                         d.hits.len(),
                         pages.len()
                     );
+                    let status = self.gens.ocr_status.lock().map(|s| s.text.clone()).unwrap_or_default();
+                    t.log += &format!("engine: {status}\n");
                     let (dir, shots) = (t.dir.clone(), t.shots.clone());
                     ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |img| {
                         let _ = write_bmp(&dir.join("ocr.bmp"), &img);
@@ -2589,8 +3243,31 @@ impl App {
                     t.phase = 2;
                 }
                 2 if t.shots.load(Ordering::Relaxed) >= 1 => {
-                    let _ = std::fs::write(t.dir.join("log.txt"), &t.log);
-                    std::process::exit(0);
+                    // Copy each page's text in turn, for scoring against the ground truth.
+                    self.last_copied = None;
+                    t.frames = 0;
+                    let _ = self.req.send(Req::Copy { id: d.id, from: (0, 0), to: (0, u32::MAX) });
+                    t.phase = 3;
+                }
+                3 if self.last_copied.is_some() => {
+                    let text = self.last_copied.take().unwrap_or_default();
+                    let dump = t.dir.join("ocr-text.txt");
+                    let mut all = std::fs::read_to_string(&dump).unwrap_or_default();
+                    if t.frames == 0 {
+                        all.clear();
+                    } else {
+                        all.push_str("\n\u{c}\n");
+                    }
+                    all.push_str(&text);
+                    let _ = std::fs::write(&dump, all);
+                    t.frames += 1;
+                    if t.frames < d.n() {
+                        let page = t.frames;
+                        let _ = self.req.send(Req::Copy { id: d.id, from: (page, 0), to: (page, u32::MAX) });
+                    } else {
+                        let _ = std::fs::write(t.dir.join("log.txt"), &t.log);
+                        std::process::exit(0);
+                    }
                 }
                 _ => {}
             }
@@ -2605,6 +3282,8 @@ impl App {
                 shots.fetch_add(1, Ordering::Relaxed);
             })));
         };
+        // Mode switches wait until the borrows of the test state and document end.
+        let mut todo = 0;
         match t.phase {
             0 if !d.loading && d.complete => {
                 t.log += &format!("first page sharp at {elapsed:.1} ms after launch\n");
@@ -2648,7 +3327,8 @@ impl App {
                 t.phase = 4;
             }
             4 if t.shots.load(Ordering::Relaxed) >= 3 => {
-                // Search and selection.
+                // Search and selection, with the results list showing.
+                self.side_tab = SideTab::Results;
                 d.fit = Fit::Page;
                 d.go_to(0);
                 d.search_open = true;
@@ -2674,6 +3354,7 @@ impl App {
             }
             6 if t.shots.load(Ordering::Relaxed) >= 4 && self.last_copied.is_some() => {
                 t.log += &format!("copied selection: {:?}\n", self.last_copied.as_deref().unwrap_or(""));
+                self.side_tab = SideTab::Pages;
                 // Highlight a selection that spans the title and three lines, plus one on page 2.
                 let yellow = [255, 216, 77];
                 let _ = self.req.send(Req::Edit { id: d.id, edit: Edit::Markup { kind: Markup::Highlight, from: (0, 0), to: (0, 260), color: yellow } });
@@ -2768,7 +3449,7 @@ impl App {
                 t.phase = 73;
             }
             73 if t.shots.load(Ordering::Relaxed) >= 7 => {
-                self.side_outline = true;
+                self.side_tab = SideTab::Outline;
                 d.two_page = true;
                 d.relayout();
                 d.fit = Fit::Width;
@@ -2784,7 +3465,7 @@ impl App {
                 }
             }
             75 if t.shots.load(Ordering::Relaxed) >= 8 => {
-                self.side_outline = false;
+                self.side_tab = SideTab::Pages;
                 d.two_page = false;
                 d.relayout();
                 d.fit = Fit::Page;
@@ -2811,6 +3492,37 @@ impl App {
                 t.phase = 8;
             }
             8 if t.shots.load(Ordering::Relaxed) >= 9 => {
+                t.zoom_started = Some(Instant::now());
+                t.frames = 0;
+                t.phase = 81;
+                todo = 1;
+            }
+            81 => {
+                t.frames += 1;
+                if t.frames > 4 && d.complete && !d.thumbs.is_empty() {
+                    let ms = t.zoom_started.unwrap().elapsed().as_secs_f64() * 1000.0;
+                    t.log += &format!("night reading: pages redrawn in {ms:.0} ms\n");
+                    shot("night.bmp", t);
+                    t.phase = 82;
+                }
+            }
+            82 if t.shots.load(Ordering::Relaxed) >= 10 => {
+                todo = 2;
+                t.frames = 0;
+                t.phase = 83;
+            }
+            83 => {
+                t.frames += 1;
+                if t.frames > 8 && d.complete && d.fit_zoom(Fit::Page) == d.zoom {
+                    shot("present.bmp", t);
+                    t.phase = 84;
+                }
+            }
+            84 if t.shots.load(Ordering::Relaxed) >= 11 => {
+                todo = 3;
+                t.phase = 85;
+            }
+            85 => {
                 if std::env::var_os("SHORUI_SELFTEST_UPDATE").is_some() {
                     // Exercise the update check against the real GitHub repo.
                     let describe = |u: Update| match u {
@@ -2831,6 +3543,15 @@ update check as 0.0.1: {}
                 let _ = std::fs::write(t.dir.join("log.txt"), &t.log);
                 std::process::exit(0);
             }
+            _ => {}
+        }
+        match todo {
+            1 => self.set_night(true),
+            2 => {
+                self.set_night(false);
+                self.set_present(ctx, true);
+            }
+            3 => self.set_present(ctx, false),
             _ => {}
         }
     }
@@ -2865,7 +3586,10 @@ impl eframe::App for App {
         if self.selftest.is_some() {
             return;
         }
-        // Remember the open tabs for next time.
+        // Remember where each file was left, and the open tabs for next time.
+        for d in self.docs.iter().filter(|d| d.error.is_none() && !d.loading && d.n() > 0) {
+            self.settings.note_place(&d.path, d.current, d.zoom, d.n());
+        }
         self.settings.session = if self.settings.restore_session {
             self.docs.iter().filter(|d| d.error.is_none() && !d.loading).map(|d| (d.path.clone(), d.current, d.zoom)).collect()
         } else {
@@ -2903,10 +3627,12 @@ impl eframe::App for App {
         }
 
         let bar = |fill: Color32| egui::Frame::new().fill(fill).inner_margin(egui::Margin::symmetric(SPACE_2 as i8, 0));
-        egui::Panel::top("tabs").exact_size(40.0).frame(bar(BG_100)).show_separator_line(false).show(ui, |ui| {
-            self.tab_bar(ui, &mut actions);
-        });
-        if !self.docs.is_empty() {
+        if self.present.is_none() {
+            egui::Panel::top("tabs").exact_size(40.0).frame(bar(BG_100)).show_separator_line(false).show(ui, |ui| {
+                self.tab_bar(ui, &mut actions);
+            });
+        }
+        if !self.docs.is_empty() && self.present.is_none() {
             egui::Panel::top("toolbar")
                 .exact_size(44.0)
                 .frame(bar(BG_200))
@@ -2925,10 +3651,16 @@ impl eframe::App for App {
 
         self.flush_thumbs();
         self.poll_update(&ctx, now);
+        self.poll_download(now);
         self.settings_window(&ctx);
         self.modals(&ctx);
         self.toast(&ctx);
         self.apply(&ctx, actions);
+        if self.present.is_some() && self.docs.get(self.active).is_none_or(|d| d.loading || d.n() == 0) {
+            // The document being presented went away.
+            self.present = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
 
         let title = match self.docs.get(self.active) {
             Some(d) => format!("{}{} - Shorui", d.title, if d.dirty { " (edited)" } else { "" }),

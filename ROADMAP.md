@@ -4,31 +4,29 @@ Planned work, not promises. Nothing here is started unless it says so. Sizes and
 
 ## OCR
 
-Shipped in 0.4.0: scanned pages are read with the OCR engine built into Windows, so find, select, copy and annotations work on them. It is offline and adds nothing to the download, but it is weaker on skewed, low-resolution or handwritten scans, and it only reads languages installed in Windows.
+Shipped in 0.4.0: scanned pages are read with the OCR engine built into Windows.
 
-### Neural OCR as an option
+Shipped in 0.5.0:
 
-Goal: a second, more accurate engine the user can switch to in Settings, without making the default install bigger or slower.
+- **Neural OCR as an option.** PP-OCRv5 mobile detection and recognition, through the DirectML build of ONNX Runtime 1.24: on the graphics card when there is one, on the processor otherwise. Downloaded on request from the `ocr-models-1` release and checked against SHA-256 hashes in the code. Latin and Chinese/Japanese recognisers. On five bad test scans it read 94% of characters against the Windows engine's 58%.
+- **OCR on its own thread**, so a slow page never holds up rendering. Visible pages first, then search, one page at a time.
+- **Disk cache** of recognised text, keyed by the file's contents.
+- **Progress**: find says which page OCR has reached.
+- **Straightening**: each detected line is read along its own direction, which handles skew up to about 45° without a separate deskew step.
+- **Per-character boxes** from the neural engine, from where CTC decoding saw each character.
 
-- **Models:** a detection model plus a recognition model in the PP-OCR "mobile" class, run through ONNX Runtime. These are small (roughly 10 to 20 MB for one language family) and much better than the Windows engine on poor scans and dense layouts.
-- **Not bundled:** the models and the runtime are downloaded the first time the user turns the option on, from this repository's releases, and verified by checksum. The installer stays near its current size. This would be the second network request Shorui ever makes, so it must be explicit and opt-in.
-- **Optimised:**
-  - Quantised (int8) models for CPU.
-  - DirectML on the GPU when one is available, CPU otherwise.
-  - Detect once per page, then recognise all text lines in batches.
-  - Render the page once at the resolution the model wants and reuse it.
-  - Same priority as today: behind tile rendering, one page per turn, cancellable.
-- **Fits the existing design:** any engine only has to return characters and boxes. `src/ocr.rs` becomes a trait with two implementations; nothing in find, selection or annotations changes.
-- **Per-language packs:** Latin first, then Japanese and Chinese as separate recognition models.
-- **Open questions:** licence of each model, real accuracy against the Windows engine on a test set of scans, and cold-start time of the runtime.
+Measured along the way, and why some planned items changed:
 
-### Around OCR
+- Dynamic int8 quantisation made recognition slower on the processor (ONNX Runtime's integer convolutions) and wrecked detection. The models ship as fp32. Static (QDQ) quantisation with a calibration set might still pay off.
+- DirectML is in maintenance at Microsoft. If it stops being updated, the replacement is Windows ML, which brings ONNX Runtime and its execution providers with Windows itself.
 
-- **Searchable PDF export:** write the recognised text into the file as an invisible text layer, so any reader can search it.
-- **Disk cache:** keep recognised text between sessions, keyed by file hash, so a long scan is read once ever, not once per open.
-- **Progress:** show how much of a scanned document has been read while a search is running.
-- **Deskew** pages before recognition.
-- **Per-character boxes:** the Windows engine gives one box per word; letters are spaced evenly inside it. Selection inside a word is therefore approximate.
+Still to do:
+
+- **Searchable PDF export**: write the recognised text into the file as an invisible text layer, so any reader can search it. Latin text can use a standard font; Chinese and Japanese need an embedded font subset.
+- **Very poor scans**: on the worst test page (105 dpi, heavy noise and blur) the Latin model reads 79% and the Chinese/Japanese model almost nothing. Try upscaling small text before recognition, and the larger "server" models as a third, opt-in pack.
+- **More language packs**: Korean, Cyrillic, Greek, Arabic, Devanagari exist as PP-OCRv5 mobile models.
+- **Reading order** for multi-column pages: lines are ordered top to bottom across the whole page, so columns interleave in copied text.
+- **Handwriting**: neither engine is good at it.
 
 ## Editing and annotations
 
@@ -42,12 +40,12 @@ Goal: a second, more accurate engine the user can switch to in Settings, without
 
 ## Reading
 
-- Remember page and zoom for every recent file, not only the last session.
-- Search options: whole word, match case.
-- Thumbnails for the outline targets; a search results list.
-- Presentation mode.
-- Invert colours for night reading.
+Shipped in 0.5.0: page and zoom remembered for every recent file, a start screen with covers and pinning, reopen closed tab, match case and whole-word search, a results list, presentation mode, and night reading.
+
+- Thumbnails for the outline targets.
 - Text-to-speech using the Windows voices.
+- A recent-files jump list on the taskbar icon.
+- Night reading that leaves photographs alone and only flips text and line art.
 
 ## Platform
 

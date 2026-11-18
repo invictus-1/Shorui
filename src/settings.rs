@@ -4,6 +4,7 @@
 //! the only time Shorui touches the network: one request to the public GitHub API, made with
 //! the `curl.exe` that ships with Windows, sending nothing but a generic user agent.
 
+use crate::ocr::Kind;
 use std::{
     os::windows::process::CommandExt,
     path::PathBuf,
@@ -28,6 +29,23 @@ pub enum OpenZoom {
     Actual,
 }
 
+/// A file opened before: where the reader was in it, and when.
+#[derive(Clone, PartialEq)]
+pub struct Recent {
+    pub path: PathBuf,
+    pub page: u32,
+    pub zoom: f32,
+    /// Page count when last open; 0 if not known yet.
+    pub pages: u32,
+    /// Unix time it was last opened.
+    pub opened: u64,
+    /// Pinned files stay at the front of the start screen and are never dropped from the list.
+    pub pinned: bool,
+}
+
+/// How many unpinned files the recent list keeps.
+const RECENT_MAX: usize = 24;
+
 #[derive(Clone, PartialEq)]
 pub struct Settings {
     pub open_zoom: OpenZoom,
@@ -40,8 +58,12 @@ pub struct Settings {
     pub two_page: bool,
     /// Read scanned pages with OCR so their text can be found and selected.
     pub ocr: bool,
+    /// Which engine reads them.
+    pub ocr_engine: Kind,
+    /// Pages drawn light on dark.
+    pub night: bool,
     /// Most recently opened files, newest first.
-    pub recent: Vec<PathBuf>,
+    pub recent: Vec<Recent>,
     /// The tabs open when Shorui last closed: file, page and zoom.
     pub session: Vec<(PathBuf, u32, f32)>,
 }
@@ -54,6 +76,8 @@ impl Default for Settings {
             restore_session: true,
             two_page: false,
             ocr: true,
+            ocr_engine: Kind::Windows,
+            night: false,
             recent: Vec::new(),
             session: Vec::new(),
         }
@@ -89,7 +113,24 @@ impl Settings {
                 ("restore_session", v) => s.restore_session = v == "true",
                 ("two_page", v) => s.two_page = v == "true",
                 ("ocr", v) => s.ocr = v == "true",
-                ("recent", v) if !v.is_empty() => s.recent.push(PathBuf::from(v)),
+                ("ocr_engine", v) => s.ocr_engine = Kind::from_key(v).unwrap_or(Kind::Windows),
+                ("night", v) => s.night = v == "true",
+                ("recent", v) if !v.is_empty() => {
+                    // file|page|zoom|pages|opened|pinned, or just the file (before 0.5).
+                    let parts: Vec<&str> = if v.matches('|').count() == 5 { v.rsplitn(6, '|').collect() } else { vec![v] };
+                    let field = |i: usize| parts.get(parts.len().wrapping_sub(1 + i)).copied().unwrap_or("");
+                    let path = PathBuf::from(field(0));
+                    if !path.as_os_str().is_empty() && !s.recent.iter().any(|r| r.path == path) {
+                        s.recent.push(Recent {
+                            path,
+                            page: field(1).parse().unwrap_or(0),
+                            zoom: field(2).parse().unwrap_or(0.0),
+                            pages: field(3).parse().unwrap_or(0),
+                            opened: field(4).parse().unwrap_or(0),
+                            pinned: field(5) == "1",
+                        });
+                    }
+                }
                 ("session", v) => {
                     // file|page|zoom. '|' can't appear in a Windows path.
                     let mut parts = v.rsplitn(3, '|');
@@ -121,8 +162,17 @@ impl Settings {
         );
         let mut text = text;
         text += &format!("restore_session={}\ntwo_page={}\nocr={}\n", self.restore_session, self.two_page, self.ocr);
+        text += &format!("ocr_engine={}\nnight={}\n", self.ocr_engine.key(), self.night);
         for r in &self.recent {
-            text += &format!("recent={}\n", r.display());
+            text += &format!(
+                "recent={}|{}|{}|{}|{}|{}\n",
+                r.path.display(),
+                r.page,
+                r.zoom,
+                r.pages,
+                r.opened,
+                if r.pinned { 1 } else { 0 }
+            );
         }
         for (path, page, zoom) in &self.session {
             text += &format!("session={}|{page}|{zoom}\n", path.display());
@@ -130,11 +180,31 @@ impl Settings {
         let _ = std::fs::write(p, text);
     }
 
-    /// Puts a file at the top of the recent list.
+    /// Puts a file at the top of the recent list, keeping where the reader was in it.
     pub fn remember(&mut self, path: &std::path::Path) {
-        self.recent.retain(|r| r != path);
-        self.recent.insert(0, path.to_path_buf());
-        self.recent.truncate(10);
+        let mut entry = match self.recent.iter().position(|r| r.path == path) {
+            Some(i) => self.recent.remove(i),
+            None => Recent { path: path.to_path_buf(), page: 0, zoom: 0.0, pages: 0, opened: 0, pinned: false },
+        };
+        entry.opened = now();
+        self.recent.insert(0, entry);
+        let mut unpinned = 0;
+        self.recent.retain(|r| {
+            unpinned += !r.pinned as usize;
+            r.pinned || unpinned <= RECENT_MAX
+        });
+    }
+
+    /// Records the page, zoom and page count a file was left at.
+    pub fn note_place(&mut self, path: &std::path::Path, page: u32, zoom: f32, pages: u32) {
+        if let Some(r) = self.recent.iter_mut().find(|r| r.path == path) {
+            (r.page, r.zoom, r.pages) = (page, zoom, pages);
+        }
+    }
+
+    /// Where a file was left last time: page and zoom.
+    pub fn place(&self, path: &std::path::Path) -> Option<(u32, f32)> {
+        self.recent.iter().find(|r| r.path == path && r.zoom > 0.0).map(|r| (r.page, r.zoom))
     }
 
     pub fn highlight_rgb(&self) -> [u8; 3] {
@@ -146,6 +216,11 @@ impl Settings {
 /// itself the default; the user confirms there.
 pub fn open_default_apps() {
     let _ = Command::new("explorer.exe").arg("ms-settings:defaultapps?registeredAppUser=Shorui").spawn();
+}
+
+/// Opens File Explorer with the file selected.
+pub fn show_in_folder(path: &std::path::Path) {
+    let _ = Command::new("explorer.exe").raw_arg(format!("/select,\"{}\"", path.display())).spawn();
 }
 
 pub fn open_url(url: &str) {

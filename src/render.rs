@@ -2,7 +2,7 @@
 //! document. The UI sends requests and gets back ready-to-draw textures; it never waits.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     os::raw::c_int,
     path::PathBuf,
     sync::{
@@ -14,6 +14,8 @@ use std::{
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use egui::{ColorImage, TextureHandle, TextureOptions};
 use pdfium_render::prelude::*;
+
+use crate::ocr::{self, Kind, Recognised};
 
 /// Tile edge in device pixels.
 pub const TILE: u32 = 1024;
@@ -42,6 +44,10 @@ pub struct Gens {
     pub search: AtomicU64,
     /// Whether pages without text are run through OCR.
     pub ocr: AtomicBool,
+    /// Night reading: pages are drawn light on dark.
+    pub night: AtomicBool,
+    /// Which OCR engine is running and how, for Settings.
+    pub ocr_status: ocr::SharedStatus,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -75,8 +81,8 @@ pub enum Req {
     Save { id: DocId, path: PathBuf },
     /// Text, links and annotation areas of one page.
     Text { id: DocId, page: u32 },
-    /// Case-insensitive search of the whole document. A newer search stamp cancels this one.
-    Search { id: DocId, query: String, stamp: u64 },
+    /// Search of the whole document. A newer search stamp cancels this one.
+    Search { id: DocId, query: String, stamp: u64, case: bool, whole: bool },
     /// The text between two (page, character) positions, inclusive.
     Copy { id: DocId, from: (u32, u32), to: (u32, u32) },
     Edit { id: DocId, edit: Edit },
@@ -85,6 +91,12 @@ pub enum Req {
     /// Writes the given pages to a new PDF.
     Extract { id: DocId, pages: Vec<u32>, path: PathBuf },
     Print { id: DocId, job: crate::print::Job },
+    /// The first page of a file that isn't open, small, for the start screen.
+    Cover { path: PathBuf, width: u32 },
+    /// Switches the OCR engine. Text read by the previous one is dropped.
+    OcrEngine(Kind),
+    /// From the OCR thread: a page has been read. `result` is None when no engine could run.
+    Ocr { id: DocId, page: u32, epoch: u64, kind: Kind, result: Option<Recognised> },
 }
 
 #[derive(Clone, PartialEq)]
@@ -180,6 +192,14 @@ pub fn line_rects(boxes: &[[f32; 4]]) -> Vec<[f32; 4]> {
     out
 }
 
+/// One search match: a rectangle per line it spans, and the words around it.
+pub struct Found {
+    pub rects: Vec<[f32; 4]>,
+    pub before: String,
+    pub matched: String,
+    pub after: String,
+}
+
 pub enum Resp {
     Fatal(String),
     Opened { id: DocId, sizes: Vec<[f32; 2]>, outline: Vec<OutlineItem> },
@@ -202,19 +222,27 @@ pub enum Resp {
     Saved { id: DocId, path: PathBuf },
     SaveFailed { id: DocId, error: String },
     Text { id: DocId, epoch: u64, page: u32, text: Arc<PageText> },
-    Hits { id: DocId, stamp: u64, page: u32, hits: Vec<Vec<[f32; 4]>> },
+    Hits { id: DocId, stamp: u64, page: u32, hits: Vec<Found> },
+    /// The search is waiting for OCR to read this page.
+    SearchReading { id: DocId, stamp: u64, page: u32 },
     SearchDone { id: DocId, stamp: u64 },
+    Cover { path: PathBuf, tex: Option<TextureHandle>, pages: u32 },
     Copied(String),
     /// A one-line result to show the user: extract and print outcomes.
     Notice { text: String, error: bool },
 }
 
-pub fn spawn(ctx: egui::Context, gens: Arc<Gens>) -> (Sender<Req>, Receiver<Resp>) {
+pub fn spawn(ctx: egui::Context, gens: Arc<Gens>, kind: Kind) -> (Sender<Req>, Receiver<Resp>) {
     let (req_tx, req_rx) = unbounded();
     let (resp_tx, resp_rx) = unbounded();
+    let ocr_tx = ocr::spawn(req_tx.clone(), gens.ocr_status.clone(), ctx.clone());
+    let _ = ocr_tx.send(ocr::Msg::Use(kind));
     std::thread::Builder::new()
         .name("pdfium".into())
-        .spawn(move || run(ctx, gens, req_rx, resp_tx))
+        .spawn({
+            let self_tx = req_tx.clone();
+            move || run(ctx, gens, req_rx, resp_tx, ocr_tx, self_tx, kind)
+        })
         .expect("spawn pdfium thread");
     (req_tx, resp_rx)
 }
@@ -261,26 +289,27 @@ enum Changed {
 
 struct Doc {
     doc: PdfDocument<'static>,
+    path: PathBuf,
     epoch: u64,
+    /// Bumped whenever pages are added, removed, moved or rotated, so OCR results for an older
+    /// page order are recognised and dropped.
+    layout: u64,
     password: Option<String>,
     undo: Vec<Step>,
     redo: Vec<Step>,
     /// Recognised text of scanned pages, kept so each page is read once.
     ocr: HashMap<u32, Arc<Recognised>>,
+    /// True while the page order is still the file's, so recognised text can go in the disk cache.
+    pristine: bool,
+    cache_loaded: bool,
+    /// Identifies the file's contents in the disk cache; worked out on first use.
+    key: Option<String>,
 }
 
-/// Characters and their boxes in top-left page points.
-type Recognised = (Vec<char>, Vec<[f32; 4]>);
-
-/// Runs OCR on a page with no text of its own.
-fn recognise(page: &PdfPage<'static>, engine: &crate::ocr::Engine) -> Option<Recognised> {
-    if page.objects().is_empty() {
-        return Some((Vec::new(), Vec::new()));
-    }
-    // About 180 dpi: enough for body text, within the engine's size limit.
+/// Renders a page for OCR at about 180 dpi, white behind it, annotations left out.
+fn render_for_ocr(page: &PdfPage<'static>) -> Option<(Vec<u8>, u32, u32, f32)> {
     let (wpt, hpt) = (page.width().value.max(1.0), page.height().value.max(1.0));
-    let cap = engine.max_dim.min(3200) as f32;
-    let scale = 2.5f32.min(cap / wpt.max(hpt));
+    let scale = 2.5f32.min(3200.0 / wpt.max(hpt));
     let (pw, ph) = ((wpt * scale).round().max(1.0) as i32, (hpt * scale).round().max(1.0) as i32);
     let mut bitmap = PdfBitmap::empty(pw, ph, PdfBitmapFormat::BGRA).ok()?;
     let config = PdfRenderConfig::new()
@@ -296,28 +325,13 @@ fn recognise(page: &PdfPage<'static>, engine: &crate::ocr::Engine) -> Option<Rec
     } else {
         raw.chunks_exact(stride).flat_map(|row| row[..pw as usize * 4].iter().copied()).collect()
     };
+    Some((bgra, pw as u32, ph as u32, scale))
+}
 
-    let lines = engine.recognise(&bgra, pw, ph)?;
-    let (mut chars, mut boxes) = (Vec::new(), Vec::new());
-    for line in lines {
-        for (i, word) in line.iter().enumerate() {
-            if i > 0 {
-                chars.push(' ');
-                boxes.push([0.0; 4]);
-            }
-            // The engine gives one box per word: share it out evenly between the letters.
-            let n = word.text.chars().count().max(1) as f32;
-            let [x0, y0, x1, y1] = word.rect;
-            for (k, c) in word.text.chars().enumerate() {
-                let (a, b) = (x0 + (x1 - x0) * k as f32 / n, x0 + (x1 - x0) * (k + 1) as f32 / n);
-                chars.push(c);
-                boxes.push([a / scale, y0 / scale, b / scale, y1 / scale]);
-            }
-        }
-        chars.extend(['\r', '\n']);
-        boxes.extend([[0.0; 4], [0.0; 4]]);
-    }
-    Some((chars, boxes))
+/// A page's text, or word that OCR is still reading it.
+enum Text {
+    Ready(Arc<PageText>),
+    Reading,
 }
 
 struct Worker {
@@ -328,9 +342,17 @@ struct Worker {
     ctx: egui::Context,
     out: Sender<Resp>,
     gens: Arc<Gens>,
-    /// The Windows OCR engine, created the first time a scanned page needs it.
-    ocr: Option<crate::ocr::Engine>,
-    ocr_tried: bool,
+    ocr_tx: Sender<ocr::Msg>,
+    /// The worker's own request queue, for results that don't come from the OCR thread.
+    self_tx: Sender<Req>,
+    ocr_kind: Kind,
+    /// The page the OCR thread is reading, and the pages waiting their turn (visible pages first).
+    ocr_busy: Option<(DocId, u32)>,
+    ocr_queue: VecDeque<(DocId, u32)>,
+    /// Pages the UI asked for text of that are being read.
+    text_waiters: HashSet<(DocId, u32)>,
+    /// A copy that waits for OCR of some of its pages.
+    copy_waiting: Option<(DocId, (u32, u32), (u32, u32))>,
 }
 
 struct TileJob {
@@ -354,17 +376,23 @@ struct SearchJob {
     query: Vec<char>,
     stamp: u64,
     next: u32,
+    case: bool,
+    whole: bool,
+    /// Waiting for OCR to read page `next`.
+    waiting: bool,
 }
 
-/// Lower-cases, drops carriage returns and turns every whitespace run into one space, keeping
-/// each output character's index in the input.
-fn normalise(chars: impl Iterator<Item = char>) -> Vec<(char, usize)> {
+/// Drops carriage returns and turns every whitespace run into one space (lower-casing too,
+/// unless `case`), keeping each output character's index in the input.
+fn normalise(chars: impl Iterator<Item = char>, case: bool) -> Vec<(char, usize)> {
     let mut out: Vec<(char, usize)> = Vec::new();
     for (i, c) in chars.enumerate() {
         if c.is_whitespace() {
             if out.last().is_some_and(|l| l.0 != ' ') {
                 out.push((' ', i));
             }
+        } else if case {
+            out.push((c, i));
         } else {
             out.push((c.to_lowercase().next().unwrap_or(c), i));
         }
@@ -372,17 +400,44 @@ fn normalise(chars: impl Iterator<Item = char>) -> Vec<(char, usize)> {
     out
 }
 
-/// Every occurrence of `query` (already normalised) on a page, as line rectangles.
-fn find(text: &PageText, query: &[char]) -> Vec<Vec<[f32; 4]>> {
-    let norm = normalise(text.chars.iter().copied());
+/// Up to `n` characters of page text, each whitespace run shown as one space.
+fn snippet(chars: &[char], n: usize, from_end: bool) -> String {
+    let mut out: Vec<char> = Vec::new();
+    let clean = |c: char| if c.is_whitespace() || c == '\u{fffe}' || c == '\u{ffff}' { ' ' } else { c };
+    let it: Box<dyn Iterator<Item = &char>> = if from_end { Box::new(chars.iter().rev()) } else { Box::new(chars.iter()) };
+    for &c in it.take(n) {
+        let c = clean(c);
+        if !(c == ' ' && out.last() == Some(&' ')) {
+            out.push(c);
+        }
+    }
+    if from_end {
+        out.reverse();
+    }
+    out.into_iter().collect()
+}
+
+/// Every occurrence of the job's query (already normalised) on a page.
+fn find(text: &PageText, job: &SearchJob) -> Vec<Found> {
+    let query = &job.query;
+    let norm = normalise(text.chars.iter().copied(), job.case);
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
     let mut hits = Vec::new();
     let mut i = 0;
     while i + query.len() <= norm.len() {
-        if norm[i..i + query.len()].iter().map(|c| c.0).eq(query.iter().copied()) {
+        let matched = norm[i..i + query.len()].iter().map(|c| c.0).eq(query.iter().copied());
+        let bounded = !job.whole
+            || ((i == 0 || !is_word(norm[i - 1].0)) && norm.get(i + query.len()).is_none_or(|c| !is_word(c.0)));
+        if matched && bounded {
             let (a, b) = (norm[i].1, norm[i + query.len() - 1].1);
             let rects = line_rects(&text.boxes[a..=b]);
             if !rects.is_empty() {
-                hits.push(rects);
+                hits.push(Found {
+                    rects,
+                    before: snippet(&text.chars[a.saturating_sub(48)..a], 48, true),
+                    matched: snippet(&text.chars[a..=b], 200, false),
+                    after: snippet(&text.chars[b + 1..(b + 49).min(text.chars.len())], 48, false),
+                });
             }
             i += query.len();
         } else {
@@ -616,7 +671,15 @@ fn outline_of(doc: &PdfDocument<'static>) -> Vec<OutlineItem> {
     out
 }
 
-fn run(ctx: egui::Context, gens: Arc<Gens>, rx: Receiver<Req>, out: Sender<Resp>) {
+fn run(
+    ctx: egui::Context,
+    gens: Arc<Gens>,
+    rx: Receiver<Req>,
+    out: Sender<Resp>,
+    ocr_tx: Sender<ocr::Msg>,
+    self_tx: Sender<Req>,
+    kind: Kind,
+) {
     let lib = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("pdfium.dll")))
@@ -639,9 +702,15 @@ fn run(ctx: egui::Context, gens: Arc<Gens>, rx: Receiver<Req>, out: Sender<Resp>
         ctx,
         out,
         gens: gens.clone(),
-        ocr: None,
-        ocr_tried: false,
+        ocr_tx,
+        self_tx,
+        ocr_kind: kind,
+        ocr_busy: None,
+        ocr_queue: VecDeque::new(),
+        text_waiters: HashSet::new(),
+        copy_waiting: None,
     };
+    std::thread::spawn(ocr::cache_trim);
 
     let mut tiles: VecDeque<TileJob> = VecDeque::new();
     let mut thumbs: VecDeque<ThumbJob> = VecDeque::new();
@@ -649,7 +718,10 @@ fn run(ctx: egui::Context, gens: Arc<Gens>, rx: Receiver<Req>, out: Sender<Resp>
     let mut search: Option<SearchJob> = None;
 
     loop {
-        let first = if tiles.is_empty() && thumbs.is_empty() && texts.is_empty() && search.is_none() {
+        // Keep the OCR thread busy whenever a page is waiting to be read.
+        w.pump_ocr();
+        let idle = search.as_ref().is_none_or(|s| s.waiting);
+        let first = if tiles.is_empty() && thumbs.is_empty() && texts.is_empty() && idle {
             match rx.recv() {
                 Ok(m) => Some(m),
                 Err(_) => return,
@@ -664,9 +736,15 @@ fn run(ctx: egui::Context, gens: Arc<Gens>, rx: Receiver<Req>, out: Sender<Resp>
                 }
                 Req::Thumb { id, page, width, stamp } => thumbs.push_back(ThumbJob { id, page, width, stamp }),
                 Req::Text { id, page } => texts.push_back((id, page)),
-                Req::Search { id, query, stamp } => {
-                    let query = normalise(query.chars()).into_iter().map(|c| c.0).collect();
-                    search = Some(SearchJob { id, query, stamp, next: 0 });
+                Req::Search { id, query, stamp, case, whole } => {
+                    let query = normalise(query.trim().chars(), case).into_iter().map(|c| c.0).collect();
+                    search = Some(SearchJob { id, query, stamp, next: 0, case, whole, waiting: false });
+                }
+                Req::Ocr { id, page, epoch, kind, result } => {
+                    w.ocr_done(id, page, epoch, kind, result);
+                    if let Some(job) = &mut search {
+                        job.waiting = false;
+                    }
                 }
                 other => w.control(other),
             }
@@ -683,10 +761,19 @@ fn run(ctx: egui::Context, gens: Arc<Gens>, rx: Receiver<Req>, out: Sender<Resp>
             }
             w.thumb(j);
         } else if let Some((id, page)) = texts.pop_front() {
-            if let (Some(epoch), Some(text)) = (w.docs.get(&id).map(|d| d.epoch), w.text(id, page)) {
-                w.send(Resp::Text { id, epoch, page, text });
+            match w.page_text(id, page, true) {
+                Some(Text::Ready(text)) => {
+                    if let Some(epoch) = w.docs.get(&id).map(|d| d.epoch) {
+                        w.send(Resp::Text { id, epoch, page, text });
+                    }
+                }
+                // Sent when OCR has finished with the page.
+                Some(Text::Reading) => {
+                    w.text_waiters.insert((id, page));
+                }
+                None => {}
             }
-        } else if let Some(job) = &mut search {
+        } else if let Some(job) = search.as_mut().filter(|j| !j.waiting) {
             // One page per turn, so tiles and selection always go first.
             let pages = w.docs.get(&job.id).map(|d| d.doc.pages().len() as u32).unwrap_or(0);
             if job.stamp < gens.search.load(Ordering::Relaxed) || job.query.is_empty() {
@@ -696,12 +783,19 @@ fn run(ctx: egui::Context, gens: Arc<Gens>, rx: Receiver<Req>, out: Sender<Resp>
                 search = None;
             } else {
                 let page = job.next;
-                job.next += 1;
-                if let Some(text) = w.text(job.id, page) {
-                    let hits = find(&text, &job.query);
-                    if !hits.is_empty() {
-                        w.send(Resp::Hits { id: job.id, stamp: job.stamp, page, hits });
+                match w.page_text(job.id, page, false) {
+                    Some(Text::Reading) => {
+                        job.waiting = true;
+                        w.send(Resp::SearchReading { id: job.id, stamp: job.stamp, page });
                     }
+                    Some(Text::Ready(text)) => {
+                        job.next += 1;
+                        let hits = find(&text, job);
+                        if !hits.is_empty() {
+                            w.send(Resp::Hits { id: job.id, stamp: job.stamp, page, hits });
+                        }
+                    }
+                    None => job.next += 1,
                 }
             }
         }
@@ -717,51 +811,171 @@ impl Worker {
     }
 
     /// A page's text, from a small cache shared by search, selection and copy. A page with no
-    /// text of its own is read with OCR, once.
-    fn text(&mut self, id: DocId, page: u32) -> Option<Arc<PageText>> {
+    /// text of its own is read with OCR, once: until that is done this returns `Reading` and the
+    /// page waits in the OCR queue, at the front when `urgent`.
+    fn page_text(&mut self, id: DocId, page: u32, urgent: bool) -> Option<Text> {
         let want_ocr = self.gens.ocr.load(Ordering::Relaxed);
         if let Some(pos) = self.texts.iter().position(|(k, _)| *k == (id, page)) {
             let t = &self.texts[pos].1;
             if t.ocr_checked || !want_ocr {
-                return Some(t.clone());
+                return Some(Text::Ready(t.clone()));
             }
             // Cached before OCR was switched on: read the page again.
             self.texts.remove(pos);
         }
-        let saved = self.docs.get(&id).and_then(|d| d.ocr.get(&page).cloned());
-        if want_ocr && saved.is_none() && !self.ocr_tried {
-            self.ocr_tried = true;
-            self.ocr = crate::ocr::Engine::new();
-        }
-        let engine = if want_ocr { self.ocr.clone() } else { None };
-
         let p = self.page(id, page)?;
         let mut t = extract(p)?;
-        let mut fresh = None;
+        let blank = p.objects().is_empty();
         if want_ocr {
-            t.ocr_checked = true;
-            if !t.chars.iter().any(|c| !c.is_whitespace()) {
-                let found = match saved {
-                    Some(r) => Some(r),
-                    None => {
-                        fresh = engine.and_then(|e| recognise(p, &e)).map(Arc::new);
-                        fresh.clone()
-                    }
+            if !t.chars.iter().any(|c| !c.is_whitespace()) && !blank {
+                self.load_cache(id);
+                let saved = self.docs.get(&id).and_then(|d| d.ocr.get(&page).cloned());
+                let Some(r) = saved else {
+                    self.queue_ocr(id, page, urgent);
+                    return Some(Text::Reading);
                 };
-                if let Some(r) = found {
-                    t.ocr = !r.0.is_empty();
-                    t.chars = r.0.clone();
-                    t.boxes = r.1.clone();
-                }
+                t.ocr = !r.0.is_empty();
+                t.chars = r.0.clone();
+                t.boxes = r.1.clone();
             }
-        }
-        if let (Some(r), Some(d)) = (fresh, self.docs.get_mut(&id)) {
-            d.ocr.insert(page, r);
+            t.ocr_checked = true;
         }
         let text = Arc::new(t);
         self.texts.push_front(((id, page), text.clone()));
         self.texts.truncate(64);
-        Some(text)
+        Some(Text::Ready(text))
+    }
+
+    /// A page's text as it is now, without waiting for OCR.
+    fn text(&mut self, id: DocId, page: u32) -> Option<Arc<PageText>> {
+        match self.page_text(id, page, false)? {
+            Text::Ready(t) => Some(t),
+            Text::Reading => self.page(id, page).and_then(extract).map(Arc::new),
+        }
+    }
+
+    fn queue_ocr(&mut self, id: DocId, page: u32, urgent: bool) {
+        if self.ocr_busy == Some((id, page)) {
+            return;
+        }
+        if let Some(pos) = self.ocr_queue.iter().position(|k| *k == (id, page)) {
+            if !urgent || pos == 0 {
+                return;
+            }
+            self.ocr_queue.remove(pos);
+        }
+        if urgent { self.ocr_queue.push_front((id, page)) } else { self.ocr_queue.push_back((id, page)) }
+    }
+
+    /// Hands the next waiting page to the OCR thread, if it is free.
+    fn pump_ocr(&mut self) {
+        while self.ocr_busy.is_none() {
+            let Some((id, page)) = self.ocr_queue.pop_front() else { return };
+            let Some((epoch, done)) = self.docs.get(&id).map(|d| (d.layout, d.ocr.contains_key(&page))) else { continue };
+            if done {
+                continue;
+            }
+            let Some((bgra, width, height, scale)) = self.page(id, page).and_then(render_for_ocr) else {
+                // Can't be rendered: report it as read with no text, so nothing waits on it.
+                let _ = self.self_tx.send(Req::Ocr { id, page, epoch, kind: self.ocr_kind, result: None });
+                continue;
+            };
+            let job = ocr::Job { id, page, epoch, bgra, width, height, scale };
+            if self.ocr_tx.send(ocr::Msg::Read(job)).is_ok() {
+                self.ocr_busy = Some((id, page));
+            }
+        }
+    }
+
+    /// Takes a page back from the OCR thread.
+    fn ocr_done(&mut self, id: DocId, page: u32, layout: u64, kind: Kind, result: Option<Recognised>) {
+        if self.ocr_busy == Some((id, page)) {
+            self.ocr_busy = None;
+        }
+        let Some(d) = self.docs.get_mut(&id) else { return };
+        if kind != self.ocr_kind || layout != d.layout {
+            // Read by an engine no longer in use, or before the pages moved: read it again if
+            // something is still waiting for it.
+            if self.text_waiters.contains(&(id, page)) {
+                self.queue_ocr(id, page, true);
+            }
+            return;
+        }
+        // No engine could run: the page counts as read, with no text.
+        let r = Arc::new(result.unwrap_or_default());
+        if d.pristine && !r.0.is_empty() {
+            if d.key.is_none() {
+                d.key = ocr::file_key(&d.path);
+            }
+            if let Some(key) = &d.key {
+                ocr::cache_store(key, kind, page, &r);
+            }
+        }
+        d.ocr.insert(page, r);
+        self.texts.retain(|(k, _)| *k != (id, page));
+        if self.text_waiters.remove(&(id, page)) {
+            if let Some(Text::Ready(text)) = self.page_text(id, page, true) {
+                let epoch = self.docs.get(&id).map(|d| d.epoch).unwrap_or(0);
+                self.send(Resp::Text { id, epoch, page, text });
+            }
+        }
+        if let Some((id, from, to)) = self.copy_waiting.take() {
+            self.copy(id, from, to);
+        }
+    }
+
+    /// Brings in pages recognised in earlier sessions, the first time the document needs OCR.
+    fn load_cache(&mut self, id: DocId) {
+        let kind = self.ocr_kind;
+        let Some(d) = self.docs.get_mut(&id) else { return };
+        if d.cache_loaded || !d.pristine {
+            return;
+        }
+        d.cache_loaded = true;
+        d.key = ocr::file_key(&d.path);
+        let Some(key) = &d.key else { return };
+        for (page, r) in ocr::cache_load(key, kind) {
+            d.ocr.entry(page).or_insert_with(|| Arc::new(r));
+        }
+    }
+
+    /// Copies the text between two positions, once OCR has read every page in between.
+    fn copy(&mut self, id: DocId, from: (u32, u32), to: (u32, u32)) {
+        let mut reading = false;
+        for page in from.0..=to.0 {
+            reading |= matches!(self.page_text(id, page, false), Some(Text::Reading));
+        }
+        if reading {
+            self.copy_waiting = Some((id, from, to));
+            return;
+        }
+        let mut out = String::new();
+        for page in from.0..=to.0 {
+            let Some(text) = self.text(id, page) else { continue };
+            let start = if page == from.0 { from.1 as usize } else { 0 };
+            let end = if page == to.0 { (to.1 as usize + 1).min(text.chars.len()) } else { text.chars.len() };
+            if start < end {
+                out.extend(text.chars[start..end].iter().filter(|c| **c != '\u{fffe}' && **c != '\u{ffff}'));
+            }
+            if page != to.0 && !out.ends_with('\n') {
+                out.push_str("\r\n");
+            }
+        }
+        self.send(Resp::Copied(out));
+    }
+
+    /// Renders the first page of a file that isn't open, for the start screen.
+    fn cover(&mut self, path: PathBuf, width: u32) {
+        let mut pages = 0;
+        let tex = self.pdfium.load_pdf_from_file(&path, None).ok().and_then(|doc| {
+            pages = doc.pages().len() as u32;
+            let page = doc.pages().get(0).ok()?;
+            let scale = width as f32 / page.width().value.max(1.0);
+            let ph = (page.height().value * scale).round().clamp(1.0, width as f32 * 2.0) as i32;
+            let image = render(&page, width as i32, ph, 0, 0, width as i32, ph, self.gens.night.load(Ordering::Relaxed))?;
+            Some(self.ctx.load_texture("cover", image, TextureOptions::LINEAR))
+        });
+        self.send(Resp::Cover { path, tex, pages });
     }
 
     fn drop_pages(&mut self, id: DocId) {
@@ -790,7 +1004,20 @@ impl Worker {
                 match self.pdfium.load_pdf_from_file(&path, password.as_deref()) {
                     Ok(doc) => {
                         let (sizes, outline) = (sizes_of(&doc), outline_of(&doc));
-                        self.docs.insert(id, Doc { doc, epoch: 0, password, undo: Vec::new(), redo: Vec::new(), ocr: HashMap::new() });
+                        let d = Doc {
+                            doc,
+                            path,
+                            epoch: 0,
+                            layout: 0,
+                            password,
+                            undo: Vec::new(),
+                            redo: Vec::new(),
+                            ocr: HashMap::new(),
+                            pristine: true,
+                            cache_loaded: false,
+                            key: None,
+                        };
+                        self.docs.insert(id, d);
                         self.send(Resp::Opened { id, sizes, outline });
                     }
                     Err(e) => {
@@ -812,6 +1039,8 @@ impl Worker {
             Req::Close { id } => {
                 self.drop_pages(id);
                 self.docs.remove(&id);
+                self.ocr_queue.retain(|k| k.0 != id);
+                self.text_waiters.retain(|k| k.0 != id);
             }
             Req::Save { id, path } => {
                 let Some(d) = self.docs.get(&id) else { return };
@@ -833,21 +1062,7 @@ impl Worker {
                     Err(error) => self.send(Resp::SaveFailed { id, error }),
                 }
             }
-            Req::Copy { id, from, to } => {
-                let mut out = String::new();
-                for page in from.0..=to.0 {
-                    let Some(text) = self.text(id, page) else { continue };
-                    let start = if page == from.0 { from.1 as usize } else { 0 };
-                    let end = if page == to.0 { (to.1 as usize + 1).min(text.chars.len()) } else { text.chars.len() };
-                    if start < end {
-                        out.extend(text.chars[start..end].iter().filter(|c| **c != '\u{fffe}' && **c != '\u{ffff}'));
-                    }
-                    if page != to.0 && !out.ends_with('\n') {
-                        out.push_str("\r\n");
-                    }
-                }
-                self.send(Resp::Copied(out));
-            }
+            Req::Copy { id, from, to } => self.copy(id, from, to),
             Req::Edit { id, edit } => self.edit(id, edit),
             Req::Undo { id } => self.history(id, true),
             Req::Redo { id } => self.history(id, false),
@@ -891,7 +1106,23 @@ impl Worker {
                     Err(e) => Resp::Notice { text: format!("Can't print. {e}"), error: true },
                 });
             }
-            Req::Tile { .. } | Req::Thumb { .. } | Req::Text { .. } | Req::Search { .. } => {}
+            Req::Cover { path, width } => self.cover(path, width),
+            Req::OcrEngine(kind) => {
+                if kind != self.ocr_kind {
+                    self.ocr_kind = kind;
+                    let _ = self.ocr_tx.send(ocr::Msg::Use(kind));
+                    // Everything read by the old engine goes; pages are read again on demand.
+                    for d in self.docs.values_mut() {
+                        d.ocr.clear();
+                        d.cache_loaded = false;
+                    }
+                    self.texts.clear();
+                    self.ocr_queue.clear();
+                    self.text_waiters.clear();
+                    self.copy_waiting = None;
+                }
+            }
+            Req::Tile { .. } | Req::Thumb { .. } | Req::Text { .. } | Req::Search { .. } | Req::Ocr { .. } => {}
         }
     }
 
@@ -1128,6 +1359,8 @@ impl Worker {
                 if let Some(d) = self.docs.get_mut(&id) {
                     d.doc = doc;
                     d.ocr.clear();
+                    d.layout += 1;
+                    d.pristine = false;
                 }
                 Ok((Step::Restore(current), Changed::All))
             }
@@ -1142,6 +1375,8 @@ impl Worker {
         if matches!(changed, Changed::All) {
             // Pages may have moved, so recognised text no longer lines up with page numbers.
             d.ocr.clear();
+            d.layout += 1;
+            d.pristine = false;
         }
         let resp = Resp::Edited {
             id,
@@ -1161,6 +1396,7 @@ impl Worker {
 
     fn tile(&mut self, j: TileJob) {
         let Some(epoch) = self.docs.get(&j.id).map(|d| d.epoch) else { return };
+        let night = self.gens.night.load(Ordering::Relaxed);
         let Some(page) = self.page(j.id, j.page) else { return };
         let pw = (page.width().value * j.scale).round().max(1.0) as i32;
         let ph = (page.height().value * j.scale).round().max(1.0) as i32;
@@ -1169,7 +1405,7 @@ impl Worker {
             return;
         }
         let (w, h) = ((pw - x0).min(TILE as i32), (ph - y0).min(TILE as i32));
-        let Some(image) = render(page, pw, ph, x0, y0, w, h) else { return };
+        let Some(image) = render(page, pw, ph, x0, y0, w, h, night) else { return };
         let bytes = (w * h * 4) as usize;
         let tex = self.ctx.load_texture("tile", image, TextureOptions::LINEAR);
         self.send(Resp::Tile { id: j.id, epoch, page: j.page, scale: j.scale, tx: j.tx, ty: j.ty, tex, bytes });
@@ -1177,18 +1413,35 @@ impl Worker {
 
     fn thumb(&mut self, j: ThumbJob) {
         let Some(epoch) = self.docs.get(&j.id).map(|d| d.epoch) else { return };
+        let night = self.gens.night.load(Ordering::Relaxed);
         let Some(page) = self.page(j.id, j.page) else { return };
         let scale = j.width as f32 / page.width().value.max(1.0);
         let pw = j.width.max(1) as i32;
         let ph = (page.height().value * scale).round().clamp(1.0, 4096.0) as i32;
-        let Some(image) = render(page, pw, ph, 0, 0, pw, ph) else { return };
+        let Some(image) = render(page, pw, ph, 0, 0, pw, ph, night) else { return };
         let tex = self.ctx.load_texture("thumb", image, TextureOptions::LINEAR);
         self.send(Resp::Thumb { id: j.id, epoch, page: j.page, tex });
     }
 }
 
+/// Night reading: flips each pixel's lightness between a dark paper and a light ink, keeping its
+/// colour, so text reads light on dark and pictures stay recognisable.
+fn to_night(rgba: &mut [u8]) {
+    const PAPER: f32 = 22.0;
+    const INK: f32 = 226.0;
+    for px in rgba.chunks_exact_mut(4) {
+        let (r, g, b) = (px[0] as f32, px[1] as f32, px[2] as f32);
+        let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let shift = PAPER + (INK - PAPER) * (1.0 - l / 255.0) - l;
+        px[0] = (r + shift).clamp(0.0, 255.0) as u8;
+        px[1] = (g + shift).clamp(0.0, 255.0) as u8;
+        px[2] = (b + shift).clamp(0.0, 255.0) as u8;
+    }
+}
+
 /// Renders the `w`×`h` window at (`x0`, `y0`) of a page drawn `pw`×`ph` pixels large.
-fn render(page: &PdfPage<'static>, pw: i32, ph: i32, x0: i32, y0: i32, w: i32, h: i32) -> Option<ColorImage> {
+#[allow(clippy::too_many_arguments)]
+fn render(page: &PdfPage<'static>, pw: i32, ph: i32, x0: i32, y0: i32, w: i32, h: i32, night: bool) -> Option<ColorImage> {
     let mut bitmap = PdfBitmap::empty(w, h, PdfBitmapFormat::BGRA).ok()?;
     let config = PdfRenderConfig::new()
         .set_target_size(pw, ph)
@@ -1199,16 +1452,18 @@ fn render(page: &PdfPage<'static>, pw: i32, ph: i32, x0: i32, y0: i32, w: i32, h
         .render_annotations(true)
         .render_form_data(true);
     page.render_into_bitmap_with_config(&mut bitmap, &config).ok()?;
-    let raw = bitmap.as_raw_bytes();
+    let mut raw = bitmap.as_raw_bytes();
     let (w, h) = (w as usize, h as usize);
     let stride = raw.len() / h;
-    if stride == w * 4 {
-        Some(ColorImage::from_rgba_premultiplied([w, h], &raw))
-    } else {
+    if stride != w * 4 {
         let mut packed = Vec::with_capacity(w * h * 4);
         for row in raw.chunks_exact(stride) {
             packed.extend_from_slice(&row[..w * 4]);
         }
-        Some(ColorImage::from_rgba_premultiplied([w, h], &packed))
+        raw = packed;
     }
+    if night {
+        to_night(&mut raw);
+    }
+    Some(ColorImage::from_rgba_premultiplied([w, h], &raw))
 }
